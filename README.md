@@ -27,7 +27,7 @@ Traffic Data
     -> Explanations
     -> Simulation
 ```
-
+![TRACE screenshot](./docs/TRACE_screenshot.png)
 ---
 
 # High-Level Architecture
