@@ -1,0 +1,571 @@
+{
+    "config": {
+        "min_lane_change_duration_s": 0.5,
+        "min_lateral_rate": 0.05,
+        "aggressive_lateral_rate": 0.5,
+        "smooth_lateral_rate": 0.15,
+        "cut_in_distance_m": 10.0,
+        "merge_convergence_threshold": 2.0,
+        "yield_deceleration_threshold": -0.5,
+        "critical_distance_m": 5.0,
+        "dangerous_headway_m": 8.0,
+        "following_headway_m": 30.0,
+        "same_lane_following_fraction": 0.75,
+        "near_miss_lateral_rate": 0.2,
+        "near_miss_probability_threshold": 0.4,
+        "avoidance_probability_threshold": 0.4,
+        "overtake_probability_threshold": 0.4,
+        "erratic_lane_change_count": 2,
+        "junction_convergence_threshold": 2.0,
+        "junction_interaction_distance_m": 12.0,
+        "close_pass_distance_m": 10.0,
+        "safe_ttc_s": 6.0,
+        "cooperative_ttc_threshold": 5.0,
+        "near_miss_ttc_s": 2.5,
+        "near_miss_convergence_threshold": 3.0,
+        "multi_stage_lane_change_count": 2,
+        "path_complexity_threshold": 4,
+        "complex_path_region_count": 5,
+        "connector_navigation_threshold": 2,
+        "close_pass_low_risk_ttc_s": 8.0,
+        "close_pass_medium_risk_ttc_s": 4.0,
+        "proximity_dist": 30.0,
+        "proximity_lat_dist": 20.0,
+        "min_event_duration": 0.0,
+        "behavior_proximity_distance_m": 5.0,
+        "behavior_proximity_decay": 0.5,
+        "behavior_closing_decay": 1.0,
+        "behavior_lateral_decay": 0.8,
+        "behavior_crossing_decay": 1.2,
+        "near_miss_weight_proximity": 0.4,
+        "near_miss_weight_lateral": 0.3,
+        "near_miss_weight_crossing": 0.3,
+        "avoidance_weight_lateral": 0.5,
+        "avoidance_weight_closing": 0.5,
+        "overtake_weight_flip": 0.5,
+        "overtake_weight_closing": 0.5,
+		"lateral_cross_threshold": 0.2,
+		"default_frame_dt": 0.1,
+		"topology_reachability_depth": 3,
+        "waiting_speed_threshold_mps": 1.0,
+        "min_wait_duration_s": 2.0,
+        "min_stop_duration_s": 1.0,
+        "gap_acceptance_window_s": 5.0,
+        "merge_wait_duration_s": 1.5,
+        "roundabout_wait_duration_s": 1.5,
+        "left_turn_wait_duration_s": 1.5
+    },
+    "decision": {
+        "name": "VehicleBehaviorTimeline",
+        "inputs": [
+            "event.type",
+            "event.features.duration",
+            "event.features.max_lateral_rate",
+            "event.features.min_dist",
+            "event.features.mean_dist",
+            "event.features.mean_closing_rate",
+            "event.metrics.from_lane",
+            "event.metrics.to_lane",
+            "interaction_lateral_cross",
+            "interaction_convergence",
+            "interaction_deceleration",
+            "interaction_sign_flip",
+            "path_relationship",
+            "actor.id",
+            "actor.lane_shift_count",
+            "shared_junction",
+            "min_ttc",
+            "distance_trend",
+            "separation_after_event",
+            "actor.path_complexity",
+            "actor.path_region_count",
+            "actor.connector_transitions",
+            "same_lane_fraction",
+            "waiting_duration_s",
+            "stopped_duration_s",
+            "config"
+        ],
+        "nodes": [
+            {
+                "id": "lateral_intensity",
+                "type": "expression",
+                "expr": "event.features.max_lateral_rate"
+            },
+            {
+                "id": "longitudinal_aggression",
+                "type": "expression",
+                "expr": "event.features.mean_closing_rate"
+            },
+            {
+                "id": "proximity_level",
+                "type": "expression",
+                "expr": "event.features.min_dist"
+            },
+			{
+			  "id": "conflicting_actor_present",
+			  "type": "expression",
+			  "expr": "path_relationship == 'merge' || path_relationship == 'crossing' || path_relationship == 'shared_junction'"
+			},
+			{
+			  "id": "gap_opened_after_wait",
+			  "type": "expression",
+			  "expr": "waiting_duration_s > 0 && separation_after_event > 0"
+			},
+			{
+			  "id": "is_highway_merge",
+			  "type": "expression",
+			  "expr": "path_relationship == 'merge'"
+			},
+			{
+			  "id": "is_left_turn_conflict",
+			  "type": "expression",
+			  "expr": "path_relationship == 'crossing' && shared_junction == true"
+			},
+			{
+			  "id": "is_roundabout_conflict",
+			  "type": "expression",
+			  "expr": "path_relationship == 'shared_junction'"
+			},
+			{
+			  "id": "near_miss_score",
+			  "type": "expression",
+			  "expr": "(interaction_convergence * 0.4) + (interaction_lateral_cross * 0.3)"
+			},
+			{
+			  "id": "overtake_score",
+			  "type": "expression",
+			  "expr": "(interaction_sign_flip * 0.6) + (interaction_convergence * 0.4)"
+			},			
+            {
+                "id": "lane_change_valid",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'lane_change' && event.features.duration >= config.min_lane_change_duration_s && event.features.max_lateral_rate > config.min_lateral_rate",
+                        "then": {
+                            "tag": "lane_change",
+                            "timeline": {
+                                "axis": "lateral",
+                                "pattern": "transition",
+                                "intensity": "event.features.max_lateral_rate"
+                            },
+                            "parameters": {
+                                "from_lane": "event.metrics.from_lane",
+                                "to_lane": "event.metrics.to_lane",
+                                "duration": "event.features.duration"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "aggressive_lane_change",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'lane_change' && event.features.max_lateral_rate > config.aggressive_lateral_rate",
+                        "then": {
+                            "tag": "aggressive_lateral",
+                            "timeline": {
+                                "axis": "lateral",
+                                "pattern": "impulsive",
+                                "intensity": "event.features.max_lateral_rate"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "smooth_lane_change",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'lane_change' && event.features.max_lateral_rate < config.smooth_lateral_rate",
+                        "then": {
+                            "tag": "smooth_lateral",
+                            "timeline": {
+                                "axis": "lateral",
+                                "pattern": "gradual",
+                                "intensity": "event.features.max_lateral_rate"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "cut_in",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'lane_change' && event.features.min_dist < config.cut_in_distance_m && interaction_lateral_cross > 0 && path_relationship != 'independent' && path_relationship != 'unknown'",
+                        "then": {
+                            "interaction": {
+                                "type": "cut_in",
+                                "timeline": {
+                                    "axis": "lateral",
+                                    "pattern": "intrusion"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "merge",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && interaction_convergence > config.merge_convergence_threshold && (path_relationship == 'merge' || path_relationship == 'crossing' || path_relationship == 'shared_junction')",
+                        "then": {
+                            "interaction": {
+                                "type": "merge",
+                                "timeline": {
+                                    "axis": "longitudinal",
+                                    "pattern": "converging"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+			{
+			  "id": "yield",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'proximity' && interaction_deceleration < config.yield_deceleration_threshold && conflicting_actor_present == true",
+				  "then": {
+					"interaction": {
+					  "type": "yield",
+					  "timeline": {
+						"axis": "longitudinal",
+						"pattern": "deceleration"
+					  }
+					}
+				  }
+				}
+			  ]
+			},
+            {
+                "id": "junction_convergence",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && shared_junction == true && interaction_convergence > config.junction_convergence_threshold",
+                        "then": {
+                            "interaction": {
+                                "type": "junction_convergence",
+                                "timeline": {
+                                    "axis": "combined",
+                                    "pattern": "converging"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "junction_crossing_interaction",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && shared_junction == true && (path_relationship == 'crossing' || path_relationship == 'shared_junction')",
+                        "then": {
+                            "interaction": {
+                                "type": "junction_crossing_interaction",
+                                "risk": "moderate"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "close_cooperative_pass",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && event.features.min_dist < config.close_pass_distance_m && min_ttc > config.safe_ttc_s && separation_after_event > 0",
+                        "then": {
+                            "interaction": {
+                                "type": "close_cooperative_pass",
+                                "pattern": "natural_resolution"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "cooperative_junction_crossing",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && shared_junction == true && (path_relationship == 'crossing' || path_relationship == 'shared_junction') && min_ttc > config.cooperative_ttc_threshold && separation_after_event > 0",
+                        "then": {
+                            "interaction": {
+                                "type": "cooperative_junction_crossing",
+                                "risk": "low"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "multi_stage_lane_positioning",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "actor.lane_shift_count >= config.multi_stage_lane_change_count && actor.path_complexity >= config.path_complexity_threshold",
+                        "then": {
+                            "behavior": {
+                                "type": "multi_stage_lane_positioning",
+                                "actor": "actor.id"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "complex_route_navigation",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "actor.path_region_count >= config.complex_path_region_count",
+                        "then": {
+                            "behavior": {
+                                "type": "complex_route_navigation",
+                                "actor": "actor.id"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "connector_navigation",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "actor.connector_transitions >= config.connector_navigation_threshold",
+                        "then": {
+                            "behavior": {
+                                "type": "connector_navigation",
+                                "actor": "actor.id"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "critical_proximity",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && proximity_level < config.critical_distance_m",
+                        "then": {
+                            "interaction": {
+                                "type": "critical_proximity",
+                                "risk": "high"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "tailgating",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && same_lane_fraction > config.same_lane_following_fraction && proximity_level < config.dangerous_headway_m",
+                        "then": {
+                            "interaction": {
+                                "type": "dangerous_following",
+                                "pattern": "short_headway"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "true_car_following",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && same_lane_fraction > config.same_lane_following_fraction && event.features.mean_dist < config.following_headway_m",
+                        "then": {
+                            "interaction": {
+                                "type": "car_following",
+                                "pattern": "stable_follow"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "near_miss_refined",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && event.features.min_dist < config.critical_distance_m && min_ttc < config.near_miss_ttc_s && interaction_convergence > config.near_miss_convergence_threshold",
+                        "then": {
+                            "interaction": {
+                                "type": "near_miss",
+                                "risk": "high"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "near_miss_evasive",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'proximity' && proximity_level < config.critical_distance_m && event.features.max_lateral_rate > config.near_miss_lateral_rate",
+                        "then": {
+                            "interaction": {
+                                "type": "near_miss",
+                                "timeline": {
+                                    "axis": "combined",
+                                    "pattern": "evasive"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+			{
+			  "id": "avoidance",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'proximity' && interaction_lateral_cross > 0 && interaction_convergence > 0.5",
+				  "then": {
+					"interaction": {
+					  "type": "avoidance"
+					}
+				  }
+				}
+			  ]
+			},
+			{
+			  "id": "overtake",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'proximity' && interaction_sign_flip > 0 && interaction_convergence > 0.5",
+				  "then": {
+					"interaction": {
+					  "type": "overtake",
+					  "timeline": {
+						"axis": "longitudinal",
+						"pattern": "ordering_flip"
+					  }
+					}
+				  }
+				}
+			  ]
+			},
+            {
+                "id": "erratic_lane_behavior",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "actor.lane_shift_count > config.erratic_lane_change_count",
+                        "then": {
+                            "behavior": {
+                                "type": "unstable_lane_behavior",
+                                "actor": "actor.id"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "id": "lane_change_fallback",
+                "type": "decision",
+                "conditions": [
+                    {
+                        "if": "event.type == 'lane_change'",
+                        "then": {
+                            "tag": "lane_change",
+                            "timeline": {
+                                "axis": "lateral",
+                                "pattern": "detected",
+                                "intensity": "event.features.max_lateral_rate"
+                            }
+                        }
+                    }
+                ]
+            },
+			{
+			  "id": "waiting_for_gap",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'waiting' && conflicting_actor_present == true && waiting_duration_s > config.min_wait_duration_s",
+				  "then": {
+					"behavior": {
+					  "type": "waiting_for_gap"
+					}
+				  }
+				}
+			  ]
+			},
+			{
+			  "id": "waiting_for_roundabout_entry",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'waiting' && is_roundabout_conflict == true && waiting_duration_s > config.roundabout_wait_duration_s",
+				  "then": {
+					"interaction": {
+					  "type": "waiting_for_roundabout_entry"
+					}
+				  }
+				}
+			  ]
+			},
+			{
+			  "id": "waiting_for_merge_gap",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'waiting' && is_highway_merge == true && waiting_duration_s > config.merge_wait_duration_s",
+				  "then": {
+					"interaction": {
+					  "type": "waiting_for_merge_gap"
+					}
+				  }
+				}
+			  ]
+			},
+			{
+			  "id": "waiting_for_left_turn_gap",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'waiting' && is_left_turn_conflict == true && waiting_duration_s > config.left_turn_wait_duration_s",
+				  "then": {
+					"interaction": {
+					  "type": "waiting_for_left_turn_gap"
+					}
+				  }
+				}
+			  ]
+			},
+			{
+			  "id": "gap_acceptance",
+			  "type": "decision",
+			  "conditions": [
+				{
+				  "if": "event.type == 'waiting' && gap_opened_after_wait == true",
+				  "then": {
+					"interaction": {
+					  "type": "gap_acceptance"
+					}
+				  }
+				}
+			  ]
+			}
+        ]
+    }
+}

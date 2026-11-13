@@ -1,0 +1,7 @@
+{
+  "mask": "./examples/Saro_lanelet20260622.png",
+  "layout": "./examples/Saro_lanelet20260622.json",
+  "homography": "./examples/saro_geojson.json",
+  "xodr": "./examples/SaroRound_2lane.xodr",
+  "openlabel": "./examples/An_VIDa_2025-10-16T134059CEST_D_clean.json"
+}

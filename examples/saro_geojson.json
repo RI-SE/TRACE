@@ -1,0 +1,113 @@
+{
+  "format": "ORBIT Georeferencing Data",
+  "version": "1.0",
+  "creator": {
+    "application": "ORBIT",
+    "application_version": "unknown"
+  },
+  "source": {
+    "project_file": "D:\\Techtest\\SYNERGIES\\scenario_rule_editor\\examples\\Saro_round.orbit",
+    "image_path": "D:\\Techtest\\SYNERGIES\\scenario_rule_editor\\examples\\median_background.png"
+  },
+  "image_size": [
+    3840,
+    2160
+  ],
+  "transform_method": "homography",
+  "control_points": [
+    {
+      "pixel_x": 2357.3786763912553,
+      "pixel_y": 1286.4078717389891,
+      "longitude": 12.008951647166743,
+      "latitude": 57.484585691968014,
+      "name": "lamppost_1a",
+      "is_validation": false
+    },
+    {
+      "pixel_x": 1454.2002028353788,
+      "pixel_y": 1224.2625639255114,
+      "longitude": 12.009611491094834,
+      "latitude": 57.48449667507564,
+      "name": "lamppost_2d",
+      "is_validation": false
+    },
+    {
+      "pixel_x": 348.40731070496065,
+      "pixel_y": 716.8668407310702,
+      "longitude": 12.010498613144026,
+      "latitude": 57.484161220753606,
+      "name": "feature_3a",
+      "is_validation": false
+    },
+    {
+      "pixel_x": 380.9921671018275,
+      "pixel_y": 749.451697127937,
+      "longitude": 12.010482270846094,
+      "latitude": 57.484163889839216,
+      "name": "feature_4a",
+      "is_validation": false
+    },
+    {
+      "pixel_x": 1816.0930453358635,
+      "pixel_y": 113.93306432470914,
+      "longitude": 12.009176025186662,
+      "latitude": 57.48393191976969,
+      "name": "lamppost_5d",
+      "is_validation": false
+    },
+    {
+      "pixel_x": 2050.795157844764,
+      "pixel_y": 195.96487063849972,
+      "longitude": 12.008980625165208,
+      "latitude": 57.48399774973272,
+      "name": "lamppost_6a",
+      "is_validation": false
+    }
+  ],
+  "reference_point": {
+    "longitude": 12.009616778767262,
+    "latitude": 57.48422285785648
+  },
+  "transformation_matrix": [
+    [
+      -0.05779710331436613,
+      0.0068792210769429585,
+      75.4542229625821
+    ],
+    [
+      0.010695578166057165,
+      0.07000169106245545,
+      -62.83390770006178
+    ],
+    [
+      3.430775102472647e-05,
+      0.00017205168289693588,
+      1.0
+    ]
+  ],
+  "inverse_matrix": [
+    [
+      -16.830692045951608,
+      -1.271023609322369,
+      1190.0834100970285
+    ],
+    [
+      2.676517670015579,
+      12.576468892860724,
+      588.2741245700628
+    ],
+    [
+      0.00011692382285678571,
+      -0.002120196676382471,
+      0.8579573615307328
+    ]
+  ],
+  "scale_factors": {
+    "x_meters_per_pixel": 0.050169741197307584,
+    "y_meters_per_pixel": 0.05980423523309182
+  },
+  "reprojection_error": {
+    "rmse_pixels": 8.639686513886898e-09,
+    "rmse_meters": 0.695592831216156
+  }
+}
