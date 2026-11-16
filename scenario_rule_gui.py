@@ -22,6 +22,7 @@ from scenario_engine import (
 from lstm_single_bridge import LSTMSingleBridge, load_single_model, load_paths_json
 from OpenScenarioExporter import OpenScenarioExporter
 from signal_engine import validate_context, Kinematics
+import traceback
 
 class ScenarioRuleGUI(QWidget):
     engine_context_ready = pyqtSignal(dict)
@@ -201,6 +202,10 @@ class ScenarioRuleGUI(QWidget):
             QMessageBox.warning(self, "Context Error", "Missing pair timeline")
             return
         self._map_context = ctx
+        ctx_duration = ctx.get("duration_seconds")
+
+        if isinstance(ctx_duration, (int, float)):
+            self.set_duration_seconds(ctx_duration)        
         try:
             self._engine_context = self._convert_to_rule_engine_context(ctx)
         except Exception as e:
@@ -347,9 +352,20 @@ class ScenarioRuleGUI(QWidget):
             return
         final_ctx = ctx   
         try:
+            duration = (
+                self.duration_seconds
+                if self.duration_seconds is not None
+                else final_ctx.get("duration_seconds")
+            )
+
+            if duration is None:
+                raise RuntimeError(
+                    "Scenario duration unavailable."
+                )
+
             raw_rules = suggest_rules_combined(
                 context=final_ctx,
-                duration=float(self.duration_seconds)
+                duration=float(duration)
             )
             descriptor = (
                 final_ctx.get("derived", {})
@@ -382,7 +398,14 @@ class ScenarioRuleGUI(QWidget):
             self._populate_insights_table(final_ctx)
 
         except Exception as e:
-            QMessageBox.critical(self, "Rule Generation Failed", str(e))
+            print("\n===== RULE GENERATION ERROR =====")
+            traceback.print_exc()
+
+            QMessageBox.critical(
+                self,
+                "Rule Generation Failed",
+                f"{type(e).__name__}: {e}"
+            )
             return
         self.rule_table.setRowCount(0)
         def rule_time_key(r):

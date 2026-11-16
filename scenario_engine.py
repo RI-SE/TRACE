@@ -848,14 +848,22 @@ def extract_sd_sequences(ctx: dict):
                     * default_dt
                 )
 
+            s_global = frame.get("s_global")
+
+            try:
+                s_global = float(
+                    s if s_global is None else s_global
+                )
+            except (TypeError, ValueError):
+                s_global = float(s)
+
             seq.append({
                 "s": float(s),
-                "s_global": float(frame.get("s_global", s)),
+                "s_global": s_global,
                 "d": float(d),
                 "t": float(t_val),
                 "lane_id": lane_id,
                 "region_id": frame.get("region_id"),
-
                 "x": frame.get("world", {}).get("x"),
                 "y": frame.get("world", {}).get("y")
             })

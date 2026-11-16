@@ -122,6 +122,46 @@ Viewer and data acquisition layer.
 
 The viewer creates the authoritative context used by the entire system.
 
+### Viewer Modes
+
+TRACE supports two independent trajectory sources:
+
+#### Manual Mode
+
+User-defined waypoint trajectories.
+
+Workflow:
+
+1. Select V1/V2
+2. Add waypoints
+3. Set Duration and FPS
+4. Press Generate
+5. Press Apply
+
+Changing Duration or FPS marks trajectories as stale and requires regeneration.
+
+#### JSON Mode
+
+OpenLABEL trajectory extraction.
+
+Workflow:
+
+1. Load OpenLABEL
+2. Select frame range
+3. Select V1 and V2
+4. Press Apply
+
+Changing frame range marks trajectory extraction as stale and requires re-Apply.
+
+#### Mode Isolation
+
+Manual trajectories and JSON trajectories are stored independently.
+
+Switching modes:
+- Does not delete trajectories
+- Does not overwrite trajectories from the other mode
+- Preserves contexts per mode
+- Restores the correct visualization automatically
 ---
 
 ## ScenarioRuleGUI

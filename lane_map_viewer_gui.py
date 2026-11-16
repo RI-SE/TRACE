@@ -409,6 +409,8 @@ class LaneMapViewer(QWidget):
         self._world_polylines_manual = {"V1": None, "V2": None}
         self._world_polylines_json = {"V1": None, "V2": None}
         self._engine_context = None
+        self._manual_dirty = False
+        self._json_dirty = False        
 
         if self.is_manual_mode:
             self._manual_traj_done = {"V1": False, "V2": False}
@@ -516,6 +518,13 @@ class LaneMapViewer(QWidget):
                 return best
 
         return members[0]
+
+    def _clear_edit_selection(self):
+        self.current_wp_vehicle = None
+        self.view.active_vehicle = None
+
+        self.ctrl_v1_btn.setStyleSheet("")
+        self.ctrl_v2_btn.setStyleSheet("")
 
     def _normalize_event(self, ev):
 
@@ -845,13 +854,24 @@ class LaneMapViewer(QWidget):
 
        
     def _on_mode_changed(self, txt):
-        self.active_mode = "manual" if txt == "Manual" else "json"
+
+        previous_mode = self.active_mode
+
+        self.active_mode = (
+            "manual"
+            if txt.lower() == "manual"
+            else "json"
+        )
+
         is_manual = self.is_manual_mode
-        if not is_manual:
-            self.view.dragging_wp = None
-            self.view.active_vehicle = None        
-        
+
+        self._clear_edit_selection()
+
+        self.view.dragging_wp = None
+        self.view.set_mode(self.active_mode)
+
         self.json_status.setVisible(not is_manual)
+
         self.ctrl_v1_btn.setVisible(is_manual)
         self.ctrl_v2_btn.setVisible(is_manual)
 
@@ -862,16 +882,22 @@ class LaneMapViewer(QWidget):
         self.ctrl_end.setEnabled(not is_manual)
 
         self.ctrl_generate.setEnabled(is_manual)
-        self.ctrl_clear.setVisible(is_manual)   #  added
+
+        self.ctrl_clear.setVisible(is_manual)
 
         self._hide_all_trajectories()
         self._show_active_mode_trajectories()
 
         self._update_waypoint_visibility()
 
-        self.view.set_mode(self.active_mode)
-        self._emit_active_context()
         self.update_status_panel()
+
+        self.log_info(
+            f"Mode changed: "
+            f"{previous_mode.upper()} -> {self.active_mode.upper()}"
+        )
+
+        self._emit_active_context()
 
     def _build_top_toolbar(self):
         row = QHBoxLayout()
@@ -1206,23 +1232,23 @@ class LaneMapViewer(QWidget):
 
 
     def _on_manual_timing_changed(self):
+
         if not self.is_manual_mode:
             return
+
         if not any(self._manual_traj_done.values()):
             return
 
-        self.log_warn(
-            "Duration/FPS changed — existing manual trajectories are invalid. "
-            "Please regenerate trajectories."
+        self._manual_dirty = True
+
+        self._invalidate_active_scenario(
+            "manual_timing_changed"
         )
 
-        self._invalidate_active_scenario("manual_duration_changed")
-        self.clear_all_trajectories()
-        self._traj_map_manual.clear()
-        self._manual_traj_done = {"V1": False, "V2": False}
-
-        self.sim_duration_s = None
-        self.duration_changed.emit(0.0)
+        self.log_warn(
+            "Manual timing changed. "
+            "Press Generate to rebuild trajectories."
+        )
 
         self.update_status_panel()
 
@@ -1539,14 +1565,26 @@ class LaneMapViewer(QWidget):
             self.log_warn("Project: Failed to save project.")
 
 
-    def _set_wp_mode(self, v):
-        self.current_wp_vehicle = v
-        self.view.enable_waypoints(v)
+    def _set_wp_mode(self, vehicle):
+        if not self.is_manual_mode:
+            return
 
-        self.ctrl_v1_btn.setStyleSheet("background:#4CAF50;color:white;" if v == "V1" else "")
-        self.ctrl_v2_btn.setStyleSheet("background:#4CAF50;color:white;" if v == "V2" else "")
+        self.current_wp_vehicle = vehicle
+        self.view.enable_waypoints(vehicle)
 
-        self.log_info(f"{v} editing ON")
+        self.ctrl_v1_btn.setStyleSheet("")
+        self.ctrl_v2_btn.setStyleSheet("")
+
+        if vehicle == "V1":
+            self.ctrl_v1_btn.setStyleSheet(
+                "background:#4CAF50;color:white;font-weight:bold;"
+            )
+        else:
+            self.ctrl_v2_btn.setStyleSheet(
+                "background:#4CAF50;color:white;font-weight:bold;"
+            )
+
+        self.log_info(f"Editing {vehicle} waypoints")
         self.update_status_panel()
 
 
@@ -1640,24 +1678,16 @@ class LaneMapViewer(QWidget):
             self.fps = 30.0
         if self._traj_map_json:
 
+            self._json_dirty = True
+
             self._invalidate_active_scenario(
                 "json_frame_range_changed"
             )
 
-            mode_items = self._traj_items.get("json", {})
-
-            for v in ("V1", "V2"):
-                self.clear_traj_items(mode_items.get(v, []))
-                mode_items[v] = []
-
-            self._traj_map_json.clear()
-
-            self._world_polylines_json = {
-                "V1": None,
-                "V2": None
-            }
-
-            self._context_json = self._empty_context()
+            self.log_warn(
+                "Frame range changed. "
+                "Press Apply to reload trajectories."
+            )
 
         self.update_vehicle_ids_for_duration()
         self.compute_and_emit_duration()
@@ -1681,6 +1711,7 @@ class LaneMapViewer(QWidget):
         self.compute_and_emit_duration()
 
         traj = self._resample_waypoints_time_based(pts, duration, fps)
+        self._manual_dirty = False
         px_pts = [(x, y) for _, x, y in traj]
 
         world_pts = self.px_to_world_polyline(px_pts)
@@ -1971,20 +2002,56 @@ class LaneMapViewer(QWidget):
 
 
     def update_status_panel(self):
-        if self.is_manual_mode:
-            v1 = "" if self._manual_traj_done["V1"] else "✏️"
-            v2 = "" if self._manual_traj_done["V2"] else "✏️"
 
-            txt = f"""
-            <b>Manual</b> | V1 {v1} | V2 {v2}<br>
-            Start: 0 | Duration: {self.wp_duration.value():.1f}s | FPS: {self.wp_fps.value()}
-            """
+        if self.is_manual_mode:
+
+            ready = (
+                self._manual_traj_done["V1"]
+                and self._manual_traj_done["V2"]
+            )
+
+            state = (
+                "REGENERATE REQUIRED"
+                if self._manual_dirty
+                else (
+                    "READY"
+                    if ready
+                    else "INCOMPLETE"
+                )
+            )
+
+            txt = (
+                f"<b>MANUAL</b> | "
+                f"State: <b>{state}</b><br>"
+                f"Duration: {self.wp_duration.value():.1f}s | "
+                f"FPS: {self.wp_fps.value()}<br>"
+                f"V1 Frames: "
+                f"{len(self._traj_map_manual.get('V1', []))} | "
+                f"V2 Frames: "
+                f"{len(self._traj_map_manual.get('V2', []))}"
+            )
+
         else:
-            txt = f"""
-            <b>JSON</b><br>
-            Range: {self.global_start_box.currentText()} → {self.global_end_box.currentText()}<br>
-            V1: {self.v1_id_box.currentText()} | V2: {self.v2_id_box.currentText()}
-            """
+
+            state = (
+                "APPLY REQUIRED"
+                if self._json_dirty
+                else (
+                    "READY"
+                    if self._traj_map_json
+                    else "NO SCENARIO"
+                )
+            )
+
+            txt = (
+                f"<b>JSON</b> | "
+                f"State: <b>{state}</b><br>"
+                f"Frames: "
+                f"{self.global_start_box.currentText()} → "
+                f"{self.global_end_box.currentText()}<br>"
+                f"V1={self.v1_id_box.currentText()} | "
+                f"V2={self.v2_id_box.currentText()}"
+            )
 
         self.status_label.setText(txt)
 
@@ -2279,7 +2346,7 @@ class LaneMapViewer(QWidget):
 
             if self.scenario_gui and hasattr(self.scenario_gui, "reset_vehicle_contexts"):
                 self.scenario_gui.reset_vehicle_contexts()
-
+            self._json_dirty = False
             self.compute_and_emit_duration()
             self._rebuild_hover_index()
             self.emit_all_vehicle_map_contexts()
