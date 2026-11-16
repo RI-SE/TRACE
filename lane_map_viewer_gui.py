@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog, QApplication, QDoubleSpinBox, QSpinBox, QTextEdit
 )
 
-from scenario_engine import suggest_rules_combined, build_engine_insight_context, enrich_with_signal_metrics, enrich_with_topology, detect_events, _build_event_timeline
+from scenario_engine import build_engine_insight_context, enrich_with_signal_metrics, enrich_with_topology, detect_events, _build_event_timeline, build_searchable_event_sequence
 from road_infrastructure import RoadInfrastructure
 from signal_engine import ContextBuilder, SignalConfig, normalize_context, validate_context, PixelPoint, WorldPoint, VehicleTrajectory
 
@@ -1038,10 +1038,9 @@ class LaneMapViewer(QWidget):
         self.ctrl_generate = QPushButton("Generate")
         self.ctrl_apply = QPushButton("Apply")
         self.ctrl_clear = QPushButton("Clear")
-        self.ctrl_build_timeline = QPushButton("Build Event Timeline")
+        self.ctrl_build_timeline = QPushButton("Build/Refresh DB Index")
 
         self.ctrl_find_similar = QPushButton("Find Similar")
-        self.ctrl_precompute = QPushButton("Precompute Index")
         self.ctrl_load_db = QPushButton("Load Semantic DB")
 
         act_row.addWidget(self.ctrl_generate)
@@ -1050,7 +1049,6 @@ class LaneMapViewer(QWidget):
         act_row.addWidget(self.ctrl_build_timeline)
         act_row.addSpacing(20)
 
-        act_row.addWidget(self.ctrl_precompute)
         act_row.addWidget(self.ctrl_find_similar)
 
         act_row.addStretch()
@@ -1396,23 +1394,78 @@ class LaneMapViewer(QWidget):
         return ctx
 
     def build_semantic_context(self, ctx):
+        """
+        Enrich a map-based context with scenario-engine events and produce a
+        normalized event timeline for indexing.
 
-        if not ctx:
+        Timing policy:
+        - Event times are retained in their source unit.
+        - Ratios are normalized using the observed event/timeline extent.
+        - Ratios are clamped to [0, 1].
+        - Raw start/end values remain available as start_t/end_t.
+
+        Location policy:
+        - Prefer the location attached directly to an event.
+        - Fall back to features, interaction, and metrics.
+        - Preserve from/to region for transition events.
+        """
+
+        if not isinstance(ctx, dict) or not ctx:
             return {}
 
         ctx["ready"] = True
 
-        duration = float(
-            ctx.get("duration_seconds", 1.0)
+        def _finite_float(value, default=None):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return default
+
+            if not math.isfinite(value):
+                return default
+
+            return value
+
+        def _first_present(*values):
+            for value in values:
+                if value is not None:
+                    return value
+            return None
+
+        def _event_name(event):
+            value = _first_present(
+                event.get("type"),
+                event.get("event"),
+                event.get("name"),
+                event.get("label"),
+            )
+
+            if isinstance(value, dict):
+                value = _first_present(
+                    value.get("type"),
+                    value.get("event"),
+                    value.get("name"),
+                    value.get("label"),
+                )
+
+            return str(value) if value is not None else "unknown"
+
+        duration = _finite_float(
+            ctx.get("duration_seconds"),
+            1.0,
         )
+        duration = max(duration, 1e-6)
+
+        # --------------------------------------------------
+        # Engine enrichment
+        # --------------------------------------------------
 
         ctx = build_engine_insight_context(
             context=ctx,
-            duration=duration
+            duration=duration,
         )
 
         ctx = enrich_with_topology(ctx)
-
         ctx = enrich_with_signal_metrics(ctx)
 
         engine = (
@@ -1420,15 +1473,288 @@ class LaneMapViewer(QWidget):
             .get("engine", {})
         )
 
-        if not engine.get("v1_sd") or not engine.get("v2_sd"):
+        has_v1 = bool(engine.get("v1_sd"))
+        has_v2 = bool(engine.get("v2_sd"))
+
+        if not (has_v1 or has_v2):
+            ctx["events"] = []
+            ctx["event_timeline"] = []
+            ctx["event_transitions"] = []
+            ctx["event_stats"] = {}
             return ctx
 
-        ctx["events"] = detect_events(ctx)
+        # --------------------------------------------------
+        # Event detection
+        # --------------------------------------------------
 
-        ctx["event_timeline"] = (
-            _build_event_timeline(ctx)
-            or []
+        raw_events = detect_events(ctx) or []
+        ctx["events"] = raw_events
+
+        timeline = _build_event_timeline(ctx) or []
+
+        valid_events = []
+
+        for idx, event in enumerate(timeline):
+            if not isinstance(event, dict):
+                continue
+
+            t0 = _finite_float(
+                _first_present(
+                    event.get("t_start"),
+                    event.get("start_t"),
+                    event.get("frame_start"),
+                )
+            )
+
+            t1 = _finite_float(
+                _first_present(
+                    event.get("t_end"),
+                    event.get("end_t"),
+                    event.get("frame_end"),
+                    t0,
+                )
+            )
+
+            if t0 is None:
+                continue
+
+            if t1 is None:
+                t1 = t0
+
+            if t1 < t0:
+                t0, t1 = t1, t0
+
+            valid_events.append(
+                (idx, event, t0, t1)
+            )
+
+        if not valid_events:
+            ctx["event_timeline"] = []
+            ctx["event_transitions"] = []
+            ctx["event_stats"] = {}
+            return ctx
+
+        # Event detectors currently use a mixture of seconds and sample/frame
+        # indices. Normalize against the actual observed extent to avoid ratios
+        # above 1.0.
+        min_time = min(item[2] for item in valid_events)
+        max_time = max(item[3] for item in valid_events)
+        observed_span = max_time - min_time
+
+        if observed_span <= 1e-9:
+            observed_span = duration
+
+        observed_span = max(observed_span, 1e-6)
+
+        normalized = []
+
+        for event_id, event, t0, t1 in valid_events:
+            metrics = event.get("metrics")
+            if not isinstance(metrics, dict):
+                metrics = {}
+
+            features = event.get("features")
+            if not isinstance(features, dict):
+                features = {}
+
+            interaction = event.get("interaction")
+            if not isinstance(interaction, dict):
+                interaction = {}
+
+            location = event.get("location")
+            if not isinstance(location, dict):
+                location = {}
+
+            participants = event.get("participants", [])
+            if isinstance(participants, str):
+                participants = [participants]
+            elif not isinstance(participants, (list, tuple, set)):
+                participants = []
+
+            region = _first_present(
+                event.get("region"),
+                event.get("region_id"),
+                location.get("region"),
+                location.get("region_id"),
+                features.get("region"),
+                features.get("region_id"),
+                interaction.get("region"),
+                interaction.get("region_id"),
+                metrics.get("region"),
+                metrics.get("region_id"),
+            )
+
+            from_region = _first_present(
+                event.get("from_region"),
+                event.get("from_lane"),
+                location.get("from_region"),
+                location.get("from_lane"),
+                features.get("from_region"),
+                features.get("from_lane"),
+                interaction.get("from_region"),
+                interaction.get("from_lane"),
+                metrics.get("from_region"),
+                metrics.get("from_lane"),
+            )
+
+            to_region = _first_present(
+                event.get("to_region"),
+                event.get("to_lane"),
+                location.get("to_region"),
+                location.get("to_lane"),
+                features.get("to_region"),
+                features.get("to_lane"),
+                interaction.get("to_region"),
+                interaction.get("to_lane"),
+                metrics.get("to_region"),
+                metrics.get("to_lane"),
+            )
+
+            # A lane transition often has only from/to lane. Use the destination
+            # as its primary location, while preserving both endpoints.
+            if region is None:
+                region = _first_present(
+                    to_region,
+                    from_region,
+                )
+
+            duration_event = max(0.0, t1 - t0)
+
+            start_ratio = (t0 - min_time) / observed_span
+            end_ratio = (t1 - min_time) / observed_span
+            duration_ratio = duration_event / observed_span
+
+            start_ratio = min(1.0, max(0.0, start_ratio))
+            end_ratio = min(1.0, max(start_ratio, end_ratio))
+            duration_ratio = min(1.0, max(0.0, duration_ratio))
+
+            normalized.append(
+                {
+                    "event_id": int(event_id),
+                    "event": _event_name(event),
+                    "start_t": t0,
+                    "end_t": t1,
+                    "duration": duration_event,
+                    "start_ratio": start_ratio,
+                    "end_ratio": end_ratio,
+                    "duration_ratio": duration_ratio,
+                    "participants": sorted(
+                        str(value)
+                        for value in participants
+                        if value is not None
+                    ),
+                    "region": region,
+                    "from_region": from_region,
+                    "to_region": to_region,
+                    "features": features,
+                    "interaction": interaction,
+                    "metrics": metrics,
+                }
+            )
+
+        normalized.sort(
+            key=lambda item: (
+                item["start_t"],
+                item["end_t"],
+                item["event"],
+                item["event_id"],
+            )
         )
+
+        # --------------------------------------------------
+        # Temporal transitions
+        # --------------------------------------------------
+
+        transitions = []
+
+        for previous, current in zip(
+            normalized[:-1],
+            normalized[1:],
+        ):
+            delta_t = current["start_t"] - previous["end_t"]
+
+            transitions.append(
+                {
+                    "src": previous["event"],
+                    "dst": current["event"],
+                    "src_event_id": previous["event_id"],
+                    "dst_event_id": current["event_id"],
+                    "delta_t": delta_t,
+                    "delta_ratio": max(
+                        0.0,
+                        delta_t / observed_span,
+                    ),
+                    "overlaps": delta_t < 0.0,
+                }
+            )
+
+        # --------------------------------------------------
+        # Per-event statistics
+        # --------------------------------------------------
+
+        stats = {}
+
+        for event in normalized:
+            bucket = stats.setdefault(
+                event["event"],
+                {
+                    "count": 0,
+                    "durations": [],
+                    "start_ratios": [],
+                    "regions": {},
+                },
+            )
+
+            bucket["count"] += 1
+            bucket["durations"].append(event["duration"])
+            bucket["start_ratios"].append(event["start_ratio"])
+
+            region = event.get("region")
+            if region is not None:
+                key = str(region)
+                bucket["regions"][key] = (
+                    bucket["regions"].get(key, 0) + 1
+                )
+
+        for bucket in stats.values():
+            durations = bucket.pop("durations")
+            start_ratios = bucket.pop("start_ratios")
+
+            bucket["mean_duration"] = (
+                float(np.mean(durations))
+                if durations
+                else 0.0
+            )
+            bucket["max_duration"] = (
+                float(np.max(durations))
+                if durations
+                else 0.0
+            )
+            bucket["mean_start_ratio"] = (
+                float(np.mean(start_ratios))
+                if start_ratios
+                else 0.0
+            )
+
+        signals = (
+            ctx.get("derived", {})
+            .get("signals", {})
+        )
+
+        ctx["path_relationship"] = signals.get(
+            "path_relationship",
+            ctx.get("path_relationship", "unknown"),
+        )
+        ctx["path_semantics"] = signals.get(
+            "path_semantics",
+            ctx.get("path_semantics", {}),
+        )
+
+        ctx["event_time_origin"] = min_time
+        ctx["event_time_span"] = observed_span
+        ctx["event_timeline"] = normalized
+        ctx["event_transitions"] = transitions
+        ctx["event_stats"] = stats
 
         return ctx
 
@@ -2356,6 +2682,38 @@ class LaneMapViewer(QWidget):
         except Exception as e:
             self.log_error(f"Apply failed: {e}")
 
+    def _filter_by_timing(
+        self,
+        seq,
+        event_name,
+        min_dur=None,
+        max_dur=None
+    ):
+
+        result = []
+
+        for e in seq:
+
+            if e["event"] != event_name:
+                continue
+
+            d = e["duration_ratio"]
+
+            if (
+                min_dur is not None
+                and d < min_dur
+            ):
+                continue
+
+            if (
+                max_dur is not None
+                and d > max_dur
+            ):
+                continue
+
+            result.append(e)
+
+        return result
 
     def find_similar_scenarios(self):
         """
@@ -2443,10 +2801,33 @@ class LaneMapViewer(QWidget):
             None
         )
 
-        if not db:
-            self.log_warn(
-                "Load event sequence DB first."
+        if db is None:
+
+            db_path = getattr(
+                self,
+                "_loaded_db_path",
+                None
             )
+
+            if (
+                db_path
+                and
+                os.path.exists(db_path)
+            ):
+                try:
+                    self.load_semantic_database(
+                        db_path
+                    )
+                    db = self.semantic_db
+                except Exception:
+                    db = None
+
+        if db is None:
+
+            self.log_warn(
+                "Build an Event Timeline first."
+            )
+
             return
 
         query_sequence = self._build_query_sequence()
@@ -2457,24 +2838,62 @@ class LaneMapViewer(QWidget):
             )
             return
 
+        tracks = db.get(
+            "tracks",
+            []
+        )
+
+        candidate_ids = (
+            self._candidate_track_indices(
+                query_sequence
+            )
+        )
+
+        query_events = {
+            e["event"]
+            for e in query_sequence
+        }
+
         results = []
 
-        for track in db.get("tracks",[]):
+        for idx in candidate_ids:
+
+            track = tracks[idx]
+
             cand_sequence = track.get(
-                "rule_signature",
+                "event_sequence",
                 []
             )
 
-            seq_score = self._sequence_similarity(
+            if not cand_sequence:
+                continue
+
+            fp = set(
+                track.get(
+                    "event_fingerprint",
+                    []
+                )
+            )
+
+            if (
+                len(
+                    query_events & fp
+                )
+                < 1
+            ):
+                continue
+
+            score = self._event_similarity(
                 query_sequence,
                 cand_sequence
             )
-            if seq_score < 0.15:
+
+            if score < 0.15:
                 continue
 
             results.append({
 
-                "score": seq_score,
+                "score": score,
 
                 "scope": track.get(
                     "scope"
@@ -2486,14 +2905,20 @@ class LaneMapViewer(QWidget):
         unique = {}
 
         for r in results:
+
+            track = r["track"]
+
             sig = (
+
                 tuple(
-                    r["track"].get(
-                        "rule_signature",
+                    ev["event"]
+                    for ev in track.get(
+                        "event_sequence",
                         []
                     )
                 ),
-                r["track"].get(
+
+                track.get(
                     "path_relationship"
                 )
             )
@@ -2501,7 +2926,9 @@ class LaneMapViewer(QWidget):
             if (
                 sig not in unique
                 or
-                r["score"] > unique[sig]["score"]
+                r["score"]
+                >
+                unique[sig]["score"]
             ):
                 unique[sig] = r
 
@@ -2520,8 +2947,11 @@ class LaneMapViewer(QWidget):
 
             track = r["track"]
             seq = " → ".join(
-                track.get(
-                    "rule_signature",
+
+                ev["event"]
+
+                for ev in track.get(
+                    "event_sequence",
                     []
                 )
             )
@@ -2532,7 +2962,7 @@ class LaneMapViewer(QWidget):
                 f"path={track.get('path_relationship')} | "
                 f"frames={track.get('start_frame')}-"
                 f"{track.get('end_frame')} | "
-                f"rules={seq}"
+                f"events={seq}"
             )
 
         self.log_info(
@@ -2548,9 +2978,67 @@ class LaneMapViewer(QWidget):
         with open(path, "r", encoding="utf-8") as f:
             self.semantic_db = json.load(f)
 
+        tracks = self.semantic_db.get(
+            "tracks",
+            []
+        )
+
+        if (
+            "_event_index" in self.semantic_db
+            and
+            "_transition_index" in self.semantic_db
+        ):
+
+            self.log_info(
+                f"Loaded event database "
+                f"({len(tracks)} tracks)"
+            )
+
+            self._loaded_db_path = path
+            return
+
+        event_index = {}
+        transition_index = {}
+
+        for idx, track in enumerate(tracks):
+
+            seq = track.get(
+                "event_sequence",
+                []
+            )
+
+            events = [
+                e["event"]
+                for e in seq
+                if isinstance(e, dict)
+                and "event" in e
+            ]
+
+            for ev in set(events):
+
+                event_index.setdefault(
+                    ev,
+                    []
+                ).append(idx)
+
+            for a, b in zip(
+                events[:-1],
+                events[1:]
+            ):
+
+                transition_index.setdefault(
+                    f"{a}>{b}",
+                    []
+                ).append(idx)
+
+        self.semantic_db["_event_index"] = event_index
+        self.semantic_db["_transition_index"] = transition_index
+
+        self._loaded_db_path = path
+
         self.log_info(
-            f"Loaded event sequence database "
-            f"({len(self.semantic_db.get('tracks', []))} tracks)"
+            f"Loaded event database "
+            f"({len(tracks)} tracks)"
         )
 
     def load_semantic_database_dialog(self):
@@ -2569,121 +3057,348 @@ class LaneMapViewer(QWidget):
 
     def _sequence_similarity(
         self,
-        query_sequence,
-        candidate_sequence
+        seq_a,
+        seq_b
     ):
 
-        n = len(query_sequence)
-        m = len(candidate_sequence)
-
-        if n == 0 or m == 0:
+        if not seq_a or not seq_b:
             return 0.0
 
-        dp = [
-            [0]*(m+1)
-            for _ in range(n+1)
+        m = len(seq_a)
+        n = len(seq_b)
+
+        prev = [0] * (n + 1)
+
+        for i in range(m):
+
+            curr = [0] * (n + 1)
+
+            ai = seq_a[i]
+
+            for j in range(n):
+
+                if ai == seq_b[j]:
+
+                    curr[j + 1] = (
+                        prev[j] + 1
+                    )
+
+                else:
+
+                    curr[j + 1] = max(
+                        curr[j],
+                        prev[j + 1]
+                    )
+
+            prev = curr
+
+        lcs = prev[n]
+
+        return (
+            2.0 * lcs
+            /
+            (m + n)
+        )
+
+    def _event_similarity(
+        self,
+        query,
+        candidate
+    ):
+
+        if not query or not candidate:
+            return 0.0
+
+        q_events = [
+            e["event"]
+            for e in query
         ]
 
-        for i in range(1, n+1):
+        c_events = [
+            e["event"]
+            for e in candidate
+        ]
 
-            for j in range(1, m+1):
+        overlap = len(
+            set(q_events)
+            &
+            set(c_events)
+        )
 
-                if (
-                    query_sequence[i-1]
-                    ==
-                    candidate_sequence[j-1]
-                ):
-                    dp[i][j] = (
-                        dp[i-1][j-1] + 1
-                    )
-                else:
-                    dp[i][j] = max(
-                        dp[i-1][j],
-                        dp[i][j-1]
-                    )
+        if overlap == 0:
+            return 0.0
 
-        lcs = dp[n][m]
+        order_score = self._sequence_similarity(
+            q_events,
+            c_events
+        )
 
-        return lcs / float(max(n, m))
+        q_trans = {
 
-    def _build_query_sequence(self):
-
-        items = []
-
-        for r in getattr(
-            self.scenario_gui,
-            "_rules",
-            []
-        ):
-
-            params = getattr(
-                r,
-                "parameters",
-                {}
-            ) or {}
-
-            subtype = params.get(
-                "subtype"
+            (
+                q_events[i],
+                q_events[i + 1]
+            ): (
+                query[i + 1]["start_ratio"]
+                -
+                query[i]["end_ratio"]
             )
 
-            if not subtype:
-                continue
+            for i in range(
+                len(query) - 1
+            )
+        }
 
-            items.append(
-                (
-                    params.get(
-                        "start_t",
-                        0.0
-                    ),
-                    str(subtype)
+        c_trans = {
+
+            (
+                c_events[i],
+                c_events[i + 1]
+            ): (
+                candidate[i + 1]["start_ratio"]
+                -
+                candidate[i]["end_ratio"]
+            )
+
+            for i in range(
+                len(candidate) - 1
+            )
+        }
+
+        shared = (
+            set(q_trans)
+            &
+            set(c_trans)
+        )
+
+        transition_score = 0.0
+
+        if shared:
+
+            vals = []
+
+            for k in shared:
+
+                vals.append(
+
+                    1.0
+                    -
+                    min(
+                        1.0,
+                        abs(
+                            q_trans[k]
+                            -
+                            c_trans[k]
+                        )
+                    )
+                )
+
+            transition_score = (
+                float(np.mean(vals))
+            )
+
+        timing_scores = []
+
+        q_map = {}
+        c_map = {}
+
+        for e in query:
+            q_map.setdefault(
+                e["event"],
+                []
+            ).append(e)
+
+        for e in candidate:
+            c_map.setdefault(
+                e["event"],
+                []
+            ).append(e)
+
+        for ev in (
+            set(q_map)
+            &
+            set(c_map)
+        ):
+
+            qa = q_map[ev][0]
+            ca = c_map[ev][0]
+
+            timing_scores.append(
+
+                max(
+                    0.0,
+
+                    1.0
+                    -
+                    (
+                        abs(
+                            qa["duration_ratio"]
+                            -
+                            ca["duration_ratio"]
+                        )
+
+                        +
+
+                        abs(
+                            qa["start_ratio"]
+                            -
+                            ca["start_ratio"]
+                        )
+                    )
+                    / 2.0
                 )
             )
 
-        items.sort(
-            key=lambda x: x[0]
+        timing_score = (
+            float(np.mean(timing_scores))
+            if timing_scores
+            else 0.0
+        )
+
+        overlap_score = (
+            overlap
+            /
+            max(
+                len(set(q_events)),
+                1
+            )
+        )
+
+        return (
+            0.35 * order_score
+            +
+            0.30 * transition_score
+            +
+            0.20 * timing_score
+            +
+            0.15 * overlap_score
+        )
+
+    def _build_query_sequence(self):
+
+        if (
+            not self.scenario_gui
+            or
+            not getattr(
+                self.scenario_gui,
+                "_engine_context",
+                None
+            )
+        ):
+            return []
+
+        ctx = self.scenario_gui._engine_context
+
+        events = (
+            ctx.get("event_timeline")
+            or []
+        )
+
+        if not events:
+            return []
+
+        seq, _, _ = (
+            build_searchable_event_sequence(
+                events
+            )
+        )
+
+        return seq
+
+    def _candidate_track_indices(
+        self,
+        query_sequence
+    ):
+
+        db = getattr(
+            self,
+            "semantic_db",
+            None
+        )
+
+        if not db:
+            return []
+
+        event_index = db.get(
+            "_event_index",
+            {}
+        )
+
+        transition_index = db.get(
+            "_transition_index",
+            {}
+        )
+
+        scores = {}
+
+        query_events = {
+            e["event"]
+            for e in query_sequence
+        }
+
+        query_transitions = {
+
+            f"{a['event']}>{b['event']}"
+
+            for a, b in zip(
+                query_sequence[:-1],
+                query_sequence[1:]
+            )
+        }
+
+        for ev in query_events:
+
+            matches = event_index.get(
+                ev,
+                []
+            )
+
+            rarity = max(
+                1.0,
+                len(matches)
+            )
+
+            weight = 100.0 / rarity
+
+            for idx in matches:
+
+                scores[idx] = (
+                    scores.get(idx, 0.0)
+                    + weight
+                )
+
+        for tr in query_transitions:
+
+            matches = transition_index.get(
+                tr,
+                []
+            )
+
+            rarity = max(
+                1.0,
+                len(matches)
+            )
+
+            weight = 200.0 / rarity
+
+            for idx in matches:
+
+                scores[idx] = (
+                    scores.get(idx, 0.0)
+                    + weight
+                )
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True
         )
 
         return [
-            x[1]
-            for x in items
+            idx
+            for idx, _
+            in ranked[:300]
         ]
-
-    def _rules_to_records(self, rules):
-
-        seen = set()
-        sigs = []
-        records = []
-
-        for r in rules:
-
-            p = getattr(r, "parameters", {}) or {}
-            subtype = p.get("subtype")
-
-            if not subtype:
-                continue
-
-            key = (
-                subtype,
-                r.actor,
-                p.get("start_t"),
-                p.get("end_t")
-            )
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-
-            sigs.append(str(subtype))
-
-            records.append({
-                "type": str(subtype),
-                "actor": r.actor,
-                "start_t": p.get("start_t"),
-                "end_t": p.get("end_t")
-            })
-
-        return sigs, records
 
     def _ctx_events(self, ctx):
 
@@ -2831,212 +3546,97 @@ class LaneMapViewer(QWidget):
                 # Vehicle tracks
                 # ==================================================
 
-                for oid in ids:
-
-                    veh = vehicle_cache.get(oid)
-                    veh_ctx = vehicle_ctx_cache.get(oid)
-
-                    if not veh or not veh_ctx:
-                        continue
+                for oid, veh in vehicle_cache.items():
 
                     try:
 
-                        duration = (
-                            veh["last_frame"]
-                            - veh["first_frame"]
-                        ) / max(self.fps, 1.0)
-
-                        tl = veh_ctx.get("timeline", {})
-
-                        route = []
-                        transitions = []
-
-                        prev_region = None
-
-                        for fr in sorted(tl):
-
-                            rid = tl[fr].get("region_id")
-
-                            if rid is None:
-                                continue
-
-                            if rid != prev_region:
-
-                                route.append(rid)
-
-                                if prev_region is not None:
-
-                                    transitions.append({
-                                        "frame": int(fr),
-                                        "from_region": prev_region,
-                                        "to_region": rid
-                                    })
-
-                                prev_region = rid
-
-                        # -----------------------------
-                        # build synthetic 2-vehicle ctx
-                        # -----------------------------
-
-                        single_ctx = {
+                        ctx_single = {
 
                             "ready": True,
 
                             "vehicles": {
-                                "V1": {
-                                    "timeline": tl
-                                },
-                                "V2": {
-                                    "timeline": {}
-                                }
+                                "V1": vehicle_ctx_cache[oid],
+                                "V2": vehicle_ctx_cache[oid]
                             },
 
                             "pair": {
                                 "timeline": {}
                             },
 
-                            "duration_seconds": duration,
+                            "duration_seconds":
+                                max(
+                                    1.0,
+                                    veh["frame_count"]
+                                    /
+                                    max(self.fps, 1.0)
+                                ),
 
-                            "meta": getattr(
-                                self.road,
-                                "meta",
-                                {}
-                            ) or {}
+                            "meta":
+                                getattr(
+                                    self.road,
+                                    "meta",
+                                    {}
+                                ) or {}
                         }
 
-                        try:
-
-                            single_ctx = self.build_semantic_context(
-                                single_ctx
+                        ctx_single = (
+                            self.build_semantic_context(
+                                ctx_single
                             )
+                        )
 
-                            rules = suggest_rules_combined(
-                                duration=duration,
-                                context=single_ctx
-                            )
+                        events = []
 
-                            sigs = []
-                            records = []
-                            seen = set()
-
-                            for r in rules:
-
-                                p = (
-                                    getattr(
-                                        r,
-                                        "parameters",
-                                        {}
-                                    )
-                                    or {}
-                                )
-
-                                subtype = p.get(
-                                    "subtype"
-                                )
-
-                                if not subtype:
-                                    continue
-
-                                key = (
-                                    subtype,
-                                    r.actor,
-                                    p.get("start_t"),
-                                    p.get("end_t")
-                                )
-
-                                if key in seen:
-                                    continue
-
-                                seen.add(key)
-
-                                sigs.append(
-                                    str(subtype)
-                                )
-
-                                records.append({
-
-                                    "type":
-                                        str(subtype),
-
-                                    "actor":
-                                        r.actor,
-
-                                    "start_t":
-                                        p.get("start_t"),
-
-                                    "end_t":
-                                        p.get("end_t"),
-
-                                    "interaction":
-                                        p.get("interaction"),
-
-                                    "behavior":
-                                        p.get("behavior"),
-
-                                    "timeline":
-                                        p.get("timeline")
-                                })
-
-
-                        except Exception:
-
-                            sigs = []
-                            records = []
-
-                        vehicle_events = []
-
-                        for ev in (
-                            single_ctx.get(
-                                "event_timeline",
-                                []
-                            )
-                            or []
+                        for ev in ctx_single.get(
+                            "event_timeline",
+                            []
                         ):
 
-                            item = {
-
-                                "type":
-                                    ev.get("type"),
-
-                                "t_start":
-                                    ev.get("t_start"),
-
-                                "t_end":
-                                    ev.get("t_end"),
-
-                                "participants":
-                                    ev.get(
-                                        "participants",
-                                        []
-                                    )
-                            }
-
-                            metrics = (
-                                ev.get("metrics")
-                                or {}
+                            participants = ev.get(
+                                "participants",
+                                []
                             )
 
-                            if metrics:
+                            # remove synthetic pair events
+                            if len(participants) > 1:
+                                continue
 
-                                item["metrics"] = metrics
+                            ev_name = ev.get("event")
 
-                                if "from_lane" in metrics:
+                            # deduplicate mirrored self-events
+                            key = (
+                                ev_name,
+                                round(
+                                    float(ev.get("start_t", 0.0)),
+                                    6
+                                ),
+                                round(
+                                    float(ev.get("end_t", 0.0)),
+                                    6
+                                ),
+                                ev.get("region"),
+                                ev.get("from_region"),
+                                ev.get("to_region")
+                            )
 
-                                    item[
-                                        "from_region"
-                                    ] = metrics[
-                                        "from_lane"
-                                    ]
+                            if not hasattr(
+                                self,
+                                "_vehicle_event_seen"
+                            ):
+                                self._vehicle_event_seen = set()
 
-                                if "to_lane" in metrics:
+                            if key in self._vehicle_event_seen:
+                                continue
 
-                                    item[
-                                        "to_region"
-                                    ] = metrics[
-                                        "to_lane"
-                                    ]
+                            self._vehicle_event_seen.add(key)
 
-                            vehicle_events.append(item)
+                            events.append(ev)
+
+                        event_sequence, event_transitions, stats = (
+                            build_searchable_event_sequence(
+                                events
+                            )
+                        )
 
                         track = {
 
@@ -3046,29 +3646,31 @@ class LaneMapViewer(QWidget):
                                 str(oid)
                             ],
 
-                            "start_frame":
+                            "first_frame":
                                 veh["first_frame"],
 
-                            "end_frame":
+                            "last_frame":
                                 veh["last_frame"],
 
                             "frame_count":
                                 veh["frame_count"],
 
-                            "route":
-                                route,
+                            "event_sequence":
+                                event_sequence,
 
-                            "transitions":
-                                transitions,
+                            "event_transitions":
+                                event_transitions,
 
-                            "rule_signature":
-                                sigs,
+                            "event_stats":
+                                stats,
 
-                            "rules":
-                                records,
-
-                            "events":
-                                vehicle_events
+                            "event_fingerprint":
+                                sorted(
+                                    {
+                                        e["event"]
+                                        for e in event_sequence
+                                    }
+                                )
                         }
 
                         first_track = self._write_track(
@@ -3082,8 +3684,10 @@ class LaneMapViewer(QWidget):
                     except Exception as e:
 
                         print(
-                            f"[VEHICLE] {oid}: {e}"
+                            f"[VEHICLE INDEX] "
+                            f"{oid}: {e}"
                         )
+
                 # ==================================================
                 # Pair tracks
                 # ==================================================
@@ -3200,6 +3804,7 @@ class LaneMapViewer(QWidget):
                                     "V2": {"timeline": tl2}
                                 },
                                 "pair": pair,
+                                "pairwise": pair,
                                 "duration_seconds": duration,
                                 "meta": getattr(
                                     self.road,
@@ -3212,79 +3817,55 @@ class LaneMapViewer(QWidget):
                                 ctx
                             )
 
-                            rules = suggest_rules_combined(
-                                duration=duration,
-                                context=ctx
+                            events = (
+                                ctx.get("event_timeline")
+                                or []
                             )
 
-                            sigs, records = (
-                                self._rules_to_records(
-                                    rules
+                            event_sequence, transitions, stats = (
+                                build_searchable_event_sequence(
+                                    events
                                 )
                             )
 
-                            if not sigs:
+                            if not event_sequence:
                                 continue
 
-                            pair_events = []
-
-                            for ev in (ctx.get("event_timeline") or []):
-
-                                item = {
-
-                                    "type":
-                                        ev.get("type"),
-
-                                    "t_start":
-                                        ev.get("t_start"),
-
-                                    "t_end":
-                                        ev.get("t_end"),
-
-                                    "participants":
-                                        ev.get(
-                                            "participants",
-                                            []
-                                        )
-                                }
-
-                                metrics = (
-                                    ev.get("metrics")
-                                    or {}
-                                )
-
-                                if metrics:
-
-                                    item["metrics"] = metrics
-
-                                    if "from_lane" in metrics:
-                                        item["from_region"] = (
-                                            metrics["from_lane"]
-                                        )
-
-                                    if "to_lane" in metrics:
-                                        item["to_region"] = (
-                                            metrics["to_lane"]
-                                        )
-
-                                pair_events.append(item)
-
                             track = {
+
                                 "scope": "pair",
+
                                 "actor_ids": [
                                     str(v1_id),
                                     str(v2_id)
                                 ],
+
                                 "start_frame": start_frame,
+
                                 "end_frame": end_frame,
+
                                 "frame_count": len(common),
+
                                 "path_relationship":
                                     ctx.get(
                                         "path_relationship"
                                     ),
-                                "rule_signature": sigs,
-                                "rules": records,
-                                "events": pair_events
+
+                                "event_sequence":
+                                    event_sequence,
+
+                                "event_transitions":
+                                    transitions,
+
+                                "event_stats":
+                                    stats,
+                                "event_fingerprint":
+                                sorted(
+                                    set(
+                                        e["event"]
+                                        for e in event_sequence
+                                    )
+                                )                                    
                             }
 
                             first_track = self._write_track(
@@ -3309,8 +3890,12 @@ class LaneMapViewer(QWidget):
 
             progress.close()
 
+            self.load_semantic_database(
+                save_path
+            )
+
             self.log_info(
-                f"Database saved.\n"
+                f"Database saved and loaded.\n"
                 f"Tracks: {tracks_written}\n"
                 f"File: {save_path}"
             )
