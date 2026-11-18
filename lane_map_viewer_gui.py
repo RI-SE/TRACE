@@ -8,15 +8,15 @@ import time
 from typing import List, Tuple
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF
 from PyQt6.QtGui import (
-    QImage, QPixmap, QColor, QPen, QBrush, QPainterPath
+    QImage, QPixmap, QColor, QPen, QBrush, QPainterPath, QPolygonF
 )
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QGraphicsView, QGraphicsScene,
     QGraphicsPathItem, QComboBox, QMessageBox, QSplitter, QSizePolicy,
-    QProgressDialog, QApplication, QDoubleSpinBox, QSpinBox, QTextEdit
+    QProgressDialog, QApplication, QDoubleSpinBox, QSpinBox, QTextEdit, QListWidget, QListWidgetItem
 )
 
 from scenario_engine import build_engine_insight_context, enrich_with_signal_metrics, enrich_with_topology, detect_events, _build_event_timeline, build_searchable_event_sequence
@@ -410,7 +410,10 @@ class LaneMapViewer(QWidget):
         self._world_polylines_json = {"V1": None, "V2": None}
         self._engine_context = None
         self._manual_dirty = False
-        self._json_dirty = False        
+        self._json_dirty = False       
+        self._last_similarity_results = [] 
+        self._similarity_items = []
+        self._similarity_candidate = None        
 
         if self.is_manual_mode:
             self._manual_traj_done = {"V1": False, "V2": False}
@@ -440,6 +443,219 @@ class LaneMapViewer(QWidget):
     @property
     def is_manual_mode(self):
         return self.active_mode in ("manual", "waypoints")
+
+    def clear_similarity_preview(self):
+
+        if not self.view:
+            return
+        scene = self.view.scene
+        for item in self._similarity_items:
+            try:
+                scene.removeItem(item)
+            except Exception:
+                pass
+        self._similarity_items.clear()
+        self._similarity_candidate = None
+
+    def _draw_preview_polyline(
+        self,
+        points,
+        color,
+        width=3
+    ):
+        if len(points) < 2:
+            return []
+        poly = QPolygonF(
+            [
+                QPointF(x, y)
+                for x, y in points
+            ]
+        )
+        item = QGraphicsPathItem()
+        path = QPainterPath()
+        path.moveTo(
+            poly[0]
+        )
+        for p in poly[1:]:
+            path.lineTo(p)
+        item.setPath(path)
+        pen = QPen(
+            QColor(color)
+        )
+        pen.setWidth(width)
+        item.setPen(pen)
+        self.view.scene.addItem(
+            item
+        )
+        return [item]
+
+    def _on_similarity_selected(self):
+
+        items = (
+            self.similar_list.selectedItems()
+        )
+
+        if not items:
+            return
+
+        idx = items[0].data(
+            Qt.ItemDataRole.UserRole
+        )
+
+        if (
+            idx is None
+            or idx >= len(
+                self._last_similarity_results
+            )
+        ):
+            return
+
+        result = (
+            self._last_similarity_results[idx]
+        )
+
+        self.preview_similarity_match(
+            result["track"]
+        )
+
+    def preview_similarity_match(
+        self,
+        track
+    ):
+
+        self.clear_similarity_preview()
+
+        actors = track.get(
+            "actor_ids",
+            []
+        )
+
+        if len(actors) < 2:
+
+            self.log_warn(
+                "Candidate has no actor pair."
+            )
+
+            return
+
+        start_frame = track.get(
+            "start_frame"
+        )
+
+        end_frame = track.get(
+            "end_frame"
+        )
+
+        if (
+            start_frame is None
+            or end_frame is None
+        ):
+
+            self.log_warn(
+                "Candidate contains no frame range."
+            )
+
+            return
+
+        traj_map = getattr(
+            self,
+            "openlabel_traj_map",
+            None
+        )
+
+        if not traj_map:
+
+            self.log_warn(
+                "OpenLABEL trajectories not loaded."
+            )
+
+            return
+
+        try:
+
+            v1 = str(actors[0])
+            v2 = str(actors[1])
+
+            if v1 not in traj_map:
+
+                self.log_warn(
+                    f"Vehicle {v1} not found."
+                )
+
+                return
+
+            if v2 not in traj_map:
+
+                self.log_warn(
+                    f"Vehicle {v2} not found."
+                )
+
+                return
+
+            traj1 = [
+                (x, y)
+
+                for f, x, y
+                in traj_map[v1]
+
+                if start_frame <= f <= end_frame
+            ]
+
+            traj2 = [
+                (x, y)
+
+                for f, x, y
+                in traj_map[v2]
+
+                if start_frame <= f <= end_frame
+            ]
+
+            self.log_info(
+                f"Preview candidate "
+                f"{v1}-{v2} "
+                f"frames={start_frame}-{end_frame} "
+                f"pts=({len(traj1)},{len(traj2)})"
+            )
+
+            if len(traj1) < 2:
+
+                self.log_warn(
+                    f"{v1} preview trajectory too short."
+                )
+
+                return
+
+            if len(traj2) < 2:
+
+                self.log_warn(
+                    f"{v2} preview trajectory too short."
+                )
+
+                return
+
+            self._similarity_items.extend(
+                self._draw_preview_polyline(
+                    traj1,
+                    "#FFD600",
+                    4
+                )
+            )
+
+            self._similarity_items.extend(
+                self._draw_preview_polyline(
+                    traj2,
+                    "#FF00FF",
+                    4
+                )
+            )
+
+            self._similarity_candidate = track
+
+        except Exception as e:
+
+            self.log_warn(
+                f"Preview failed: {e}"
+            )
 
     def _resolve_to_lane(self, rid, wp_obj, last_lane=None):
         if rid is None or not self.road:
@@ -1058,6 +1274,20 @@ class LaneMapViewer(QWidget):
         # --------------------------------------------------
         # Status row
         # --------------------------------------------------
+        self.similar_list = QListWidget()
+        self.similar_list.setMinimumHeight(220)
+
+        self.similar_list.itemSelectionChanged.connect(
+            self._on_similarity_selected
+        )
+
+        layout.addWidget(
+            QLabel("Similarity Matches")
+        )
+
+        layout.addWidget(
+            self.similar_list
+        )        
 
         status_row = QHBoxLayout()
 
@@ -2843,12 +3073,24 @@ class LaneMapViewer(QWidget):
             []
         )
 
+        print("\n=== QUERY SEQUENCE ===")
+        print("len =", len(query_sequence))
+
+        for e in query_sequence:
+            print(
+                e["event"],
+                e["participants"]
+            )
+
         candidate_ids = (
             self._candidate_track_indices(
                 query_sequence
             )
         )
-
+        print(
+            "candidate_ids =",
+            len(candidate_ids)
+        )
         query_events = {
             e["event"]
             for e in query_sequence
@@ -2939,36 +3181,50 @@ class LaneMapViewer(QWidget):
             reverse=True
         )
 
-        top = results[:20]
+        self._last_similarity_results = results[:50]
 
-        lines = []
+        self.similar_list.clear()
 
-        for i, r in enumerate(top, start=1):
+        for idx, r in enumerate(
+            self._last_similarity_results,
+            start=1
+        ):
 
             track = r["track"]
+
             seq = " → ".join(
-
                 ev["event"]
-
                 for ev in track.get(
                     "event_sequence",
                     []
                 )
             )
 
-            lines.append(
-                f"{i}. "
-                f"score={r['score']:.3f} | "
-                f"path={track.get('path_relationship')} | "
-                f"frames={track.get('start_frame')}-"
-                f"{track.get('end_frame')} | "
-                f"events={seq}"
+            item_text = (
+                f"{idx}. "
+                f"{r['score']:.3f} | "
+                f"{track.get('path_relationship')} | "
+                f"{track.get('start_frame')}-"
+                f"{track.get('end_frame')}\n"
+                f"{seq}"
+            )
+
+            item = QListWidgetItem(
+                item_text
+            )
+
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                idx - 1
+            )
+
+            self.similar_list.addItem(
+                item
             )
 
         self.log_info(
-            "Top Event Sequence Matches\n\n"
-            +
-            "\n".join(lines)
+            f"{len(self._last_similarity_results)} "
+            f"candidate matches found."
         )
         return
 
@@ -3128,122 +3384,103 @@ class LaneMapViewer(QWidget):
         if overlap == 0:
             return 0.0
 
-        order_score = self._sequence_similarity(
-            q_events,
-            c_events
+        #
+        # event order
+        #
+
+        order_score = (
+            self._sequence_similarity(
+                q_events,
+                c_events
+            )
         )
 
-        q_trans = {
+        #
+        # transition order
+        #
 
-            (
-                q_events[i],
-                q_events[i + 1]
-            ): (
-                query[i + 1]["start_ratio"]
-                -
-                query[i]["end_ratio"]
+        q_trans = set(
+            zip(
+                q_events[:-1],
+                q_events[1:]
             )
-
-            for i in range(
-                len(query) - 1
-            )
-        }
-
-        c_trans = {
-
-            (
-                c_events[i],
-                c_events[i + 1]
-            ): (
-                candidate[i + 1]["start_ratio"]
-                -
-                candidate[i]["end_ratio"]
-            )
-
-            for i in range(
-                len(candidate) - 1
-            )
-        }
-
-        shared = (
-            set(q_trans)
-            &
-            set(c_trans)
         )
 
-        transition_score = 0.0
-
-        if shared:
-
-            vals = []
-
-            for k in shared:
-
-                vals.append(
-
-                    1.0
-                    -
-                    min(
-                        1.0,
-                        abs(
-                            q_trans[k]
-                            -
-                            c_trans[k]
-                        )
-                    )
-                )
-
-            transition_score = (
-                float(np.mean(vals))
+        c_trans = set(
+            zip(
+                c_events[:-1],
+                c_events[1:]
             )
+        )
+
+        transition_score = (
+            len(q_trans & c_trans)
+            /
+            max(
+                len(q_trans | c_trans),
+                1
+            )
+        )
+
+        #
+        # timing
+        #
 
         timing_scores = []
 
-        q_map = {}
-        c_map = {}
+        q_by_type = {}
+        c_by_type = {}
 
         for e in query:
-            q_map.setdefault(
+
+            q_by_type.setdefault(
                 e["event"],
                 []
             ).append(e)
 
         for e in candidate:
-            c_map.setdefault(
+
+            c_by_type.setdefault(
                 e["event"],
                 []
             ).append(e)
 
-        for ev in (
-            set(q_map)
+        for evt in (
+            set(q_by_type)
             &
-            set(c_map)
+            set(c_by_type)
         ):
 
-            qa = q_map[ev][0]
-            ca = c_map[ev][0]
+            qa = q_by_type[evt][0]
+            ca = c_by_type[evt][0]
+
+            start_score = (
+                1.0
+                -
+                abs(
+                    qa["start_ratio"]
+                    -
+                    ca["start_ratio"]
+                )
+            )
+
+            dur_score = (
+                1.0
+                -
+                abs(
+                    qa["duration_ratio"]
+                    -
+                    ca["duration_ratio"]
+                )
+            )
 
             timing_scores.append(
-
                 max(
                     0.0,
-
-                    1.0
-                    -
                     (
-                        abs(
-                            qa["duration_ratio"]
-                            -
-                            ca["duration_ratio"]
-                        )
-
+                        start_score
                         +
-
-                        abs(
-                            qa["start_ratio"]
-                            -
-                            ca["start_ratio"]
-                        )
+                        dur_score
                     )
                     / 2.0
                 )
@@ -3255,23 +3492,85 @@ class LaneMapViewer(QWidget):
             else 0.0
         )
 
-        overlap_score = (
-            overlap
-            /
-            max(
-                len(set(q_events)),
-                1
-            )
+        #
+        # role similarity
+        #
+        # actor swap is allowed
+        #
+
+        role_score = 0.0
+
+        shared_events = (
+            set(q_by_type)
+            &
+            set(c_by_type)
         )
 
+        if shared_events:
+
+            matches = []
+
+            for evt in shared_events:
+
+                qa = q_by_type[evt][0]
+                ca = c_by_type[evt][0]
+
+                qp = set(
+                    qa.get(
+                        "participants",
+                        []
+                    )
+                )
+
+                cp = set(
+                    ca.get(
+                        "participants",
+                        []
+                    )
+                )
+
+                #
+                # exact match
+                #
+
+                if qp == cp:
+
+                    matches.append(1.0)
+
+                #
+                # same cardinality
+                # actorA <-> actorB swap
+                #
+
+                elif len(qp) == len(cp):
+
+                    matches.append(0.7)
+
+                else:
+
+                    matches.append(0.0)
+
+            role_score = (
+                float(np.mean(matches))
+                if matches
+                else 0.0
+            )
+
         return (
-            0.35 * order_score
+
+            0.40 * order_score
+
             +
-            0.30 * transition_score
+
+            0.20 * transition_score
+
             +
+
             0.20 * timing_score
+
             +
-            0.15 * overlap_score
+
+            0.20 * role_score
         )
 
     def _build_query_sequence(self):
@@ -3285,9 +3584,20 @@ class LaneMapViewer(QWidget):
                 None
             )
         ):
+            print("NO ENGINE CONTEXT")
             return []
 
         ctx = self.scenario_gui._engine_context
+
+        print(
+            "timeline size =",
+            len(
+                ctx.get(
+                    "event_timeline",
+                    []
+                )
+            )
+        )
 
         events = (
             ctx.get("event_timeline")
@@ -3295,6 +3605,7 @@ class LaneMapViewer(QWidget):
         )
 
         if not events:
+            print("NO EVENTS")
             return []
 
         seq, _, _ = (
@@ -3303,7 +3614,13 @@ class LaneMapViewer(QWidget):
             )
         )
 
+        print(
+            "query events:",
+            [e["event"] for e in seq]
+        )
+
         return seq
+
 
     def _candidate_track_indices(
         self,
@@ -3331,15 +3648,20 @@ class LaneMapViewer(QWidget):
 
         scores = {}
 
+        #
+        # IMPORTANT:
+        # Use raw event names only.
+        # Do NOT use event_token here.
+        #
         query_events = {
             e["event"]
             for e in query_sequence
         }
 
+        print("query_events", query_events)
+
         query_transitions = {
-
             f"{a['event']}>{b['event']}"
-
             for a, b in zip(
                 query_sequence[:-1],
                 query_sequence[1:]
@@ -3352,7 +3674,10 @@ class LaneMapViewer(QWidget):
                 ev,
                 []
             )
-
+            print(
+                ev,
+                len(matches)
+            )
             rarity = max(
                 1.0,
                 len(matches)
@@ -3397,7 +3722,7 @@ class LaneMapViewer(QWidget):
         return [
             idx
             for idx, _
-            in ranked[:300]
+            in ranked[:500]
         ]
 
     def _ctx_events(self, ctx):

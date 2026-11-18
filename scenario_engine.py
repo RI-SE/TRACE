@@ -3601,126 +3601,211 @@ def build_event_sequence(events):
 
     return seq
 
-def build_searchable_event_sequence(events):
+def canonicalize_event_roles(events):
     """
-    Convert a normalized event timeline into a compact search sequence.
+    Make vehicle1/vehicle2 role-independent.
 
-    The function is intentionally tolerant of older database schemas and
-    partially populated event records.
+    Example:
+
+        vehicle1 waiting
+        vehicle2 lane_change
+
+    and
+
+        vehicle2 waiting
+        vehicle1 lane_change
+
+    become identical.
+
+    Returns:
+        normalized_events
     """
+
+    if not events:
+        return []
+
+    actor_map = {}
+
+    next_actor = 0
+
+    def map_actor(actor):
+
+        nonlocal next_actor
+
+        if actor not in actor_map:
+
+            actor_map[actor] = (
+                f"actor{chr(65 + next_actor)}"
+            )
+
+            next_actor += 1
+
+        return actor_map[actor]
+
+    normalized = []
+
+    for ev in events:
+
+        parts = list(
+            ev.get(
+                "participants",
+                []
+            )
+        )
+
+        mapped = sorted(
+            map_actor(p)
+            for p in parts
+        )
+
+        clone = dict(ev)
+
+        clone["participants"] = mapped
+
+        normalized.append(clone)
+
+    return normalized
+
+def build_searchable_event_sequence(events):
 
     if not events:
         return [], [], {}
 
-    def _finite_float(value, default=0.0):
+    events = canonicalize_event_roles(events)
+
+    def _finite_float(v, default=0.0):
         try:
-            value = float(value)
-        except (TypeError, ValueError):
+            v = float(v)
+
+            if not math.isfinite(v):
+                return default
+
+            return v
+
+        except Exception:
             return default
 
-        if not math.isfinite(value):
-            return default
+    def _event_name(ev):
 
-        return value
+        value = ev.get("event")
 
-    def _event_name(value):
+        #
+        # normalized timeline
+        #
+
         if isinstance(value, str):
             return value
 
+        #
+        # flattened GoRules timeline
+        #
+
         if isinstance(value, dict):
-            value = (
-                value.get("type")
-                or value.get("event")
-                or value.get("name")
-                or value.get("label")
+
+            return str(
+                value.get(
+                    "type",
+                    value.get(
+                        "event",
+                        "unknown"
+                    )
+                )
             )
 
-        return str(value) if value is not None else "unknown"
+        #
+        # raw detector event
+        #
+
+        value = ev.get("type")
+
+        if isinstance(value, str):
+            return value
+
+        return "unknown"
 
     prepared = []
 
-    for ordinal, event in enumerate(events):
-        if not isinstance(event, dict):
-            continue
+    for idx, e in enumerate(events):
 
-        name = _event_name(
-            event.get(
-                "event",
-                event.get("type"),
+        participants = tuple(
+            sorted(
+                e.get(
+                    "participants",
+                    []
+                )
             )
         )
 
-        start_t = _finite_float(
-            event.get(
-                "start_t",
-                event.get("t_start", 0.0),
-            )
+        actor_tag = (
+            ",".join(participants)
+            if participants
+            else "none"
         )
 
-        start_ratio = min(
-            1.0,
-            max(
-                0.0,
+        event_name = _event_name(e)
+
+        prepared.append({
+
+            "_idx": idx,
+
+            "_start":
                 _finite_float(
-                    event.get("start_ratio"),
-                    0.0,
+                    e.get(
+                        "start_t",
+                        e.get(
+                            "t_start",
+                            0.0
+                        )
+                    )
                 ),
-            ),
-        )
 
-        end_ratio = min(
-            1.0,
-            max(
-                start_ratio,
+            "event":
+                event_name,
+
+            "event_token":
+                f"{actor_tag}:{event_name}",
+
+            "participants":
+                list(participants),
+
+            "start_ratio":
                 _finite_float(
-                    event.get("end_ratio"),
-                    start_ratio,
+                    e.get(
+                        "start_ratio",
+                        0.0
+                    )
                 ),
-            ),
-        )
 
-        duration_ratio = min(
-            1.0,
-            max(
-                0.0,
+            "end_ratio":
                 _finite_float(
-                    event.get("duration_ratio"),
-                    end_ratio - start_ratio,
+                    e.get(
+                        "end_ratio",
+                        0.0
+                    )
                 ),
-            ),
-        )
 
-        participants = event.get("participants", [])
-
-        if isinstance(participants, str):
-            participants = [participants]
-        elif not isinstance(participants, (list, tuple, set)):
-            participants = []
-
-        prepared.append(
-            {
-                "_ordinal": ordinal,
-                "_start_t": start_t,
-                "event": name,
-                "start_ratio": start_ratio,
-                "end_ratio": end_ratio,
-                "duration_ratio": duration_ratio,
-                "participants": sorted(
-                    str(value)
-                    for value in participants
-                    if value is not None
+            "duration_ratio":
+                _finite_float(
+                    e.get(
+                        "duration_ratio",
+                        0.0
+                    )
                 ),
-                "region": event.get("region"),
-                "from_region": event.get("from_region"),
-                "to_region": event.get("to_region"),
-            }
-        )
+
+            "region":
+                e.get("region"),
+
+            "from_region":
+                e.get("from_region"),
+
+            "to_region":
+                e.get("to_region")
+        })
 
     prepared.sort(
-        key=lambda event: (
-            event["_start_t"],
-            event["event"],
-            event["_ordinal"],
+        key=lambda x: (
+            x["_start"],
+            x["_idx"]
         )
     )
 
@@ -3728,107 +3813,46 @@ def build_searchable_event_sequence(events):
     transitions = []
     stats = {}
 
-    previous = None
+    prev = None
 
-    for item in prepared:
-        record = {
-            "event": item["event"],
-            "start_ratio": item["start_ratio"],
-            "end_ratio": item["end_ratio"],
-            "duration_ratio": item["duration_ratio"],
-            "participants": item["participants"],
-            "region": item["region"],
-            "from_region": item["from_region"],
-            "to_region": item["to_region"],
-        }
+    for rec in prepared:
 
-        sequence.append(record)
+        sequence.append(rec)
 
-        bucket = stats.setdefault(
-            record["event"],
+        stats.setdefault(
+            rec["event"],
             {
-                "count": 0,
-                "durations": [],
-                "start_ratios": [],
-                "regions": {},
-            },
+                "count": 0
+            }
         )
 
-        bucket["count"] += 1
-        bucket["durations"].append(record["duration_ratio"])
-        bucket["start_ratios"].append(record["start_ratio"])
+        stats[
+            rec["event"]
+        ]["count"] += 1
 
-        if record["region"] is not None:
-            region_key = str(record["region"])
-            bucket["regions"][region_key] = (
-                bucket["regions"].get(region_key, 0) + 1
-            )
+        if prev:
 
-        if previous is not None:
-            delta_ratio = (
-                record["start_ratio"]
-                - previous["end_ratio"]
-            )
+            transitions.append({
 
-            transitions.append(
-                {
-                    "src": previous["event"],
-                    "dst": record["event"],
-                    "delta_ratio": max(0.0, delta_ratio),
-                    "overlaps": delta_ratio < 0.0,
-                }
-            )
+                "src":
+                    prev["event"],
 
-        previous = record
+                "dst":
+                    rec["event"],
 
-    for bucket in stats.values():
-        durations = bucket.pop("durations")
-        starts = bucket.pop("start_ratios")
+                "delta_ratio":
+                    max(
+                        0.0,
+                        rec["start_ratio"]
+                        -
+                        prev["end_ratio"]
+                    )
+            })
 
-        bucket["mean_duration"] = (
-            float(np.mean(durations))
-            if durations
-            else 0.0
-        )
-        bucket["max_duration"] = (
-            float(np.max(durations))
-            if durations
-            else 0.0
-        )
-        bucket["mean_start_ratio"] = (
-            float(np.mean(starts))
-            if starts
-            else 0.0
-        )
-
-    return sequence, transitions, stats
-
-def event_alignment_score(
-    query,
-    candidate
-):
-
-    q = [
-        e.event_type
-        for e in query
-    ]
-
-    c = [
-        e.event_type
-        for e in candidate
-    ]
-
-    order_score = sequence_match_score(
-        q,
-        c
-    )
-
-    dur_score = duration_similarity(
-        query,
-        candidate
-    )
+        prev = rec
 
     return (
-        0.7 * order_score
-        + 0.3 * dur_score
+        sequence,
+        transitions,
+        stats
     )
