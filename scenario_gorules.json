@@ -70,17 +70,18 @@
             "interaction_convergence",
             "interaction_deceleration",
             "interaction_sign_flip",
-            "path_relationship",
             "actor.id",
             "actor.lane_shift_count",
-            "shared_junction",
+			"shared_junction",
+			"common_merge_count",
+			"common_diverge_count",
+			"shared_lane_fraction",	
             "min_ttc",
             "distance_trend",
             "separation_after_event",
             "actor.path_complexity",
             "actor.path_region_count",
             "actor.connector_transitions",
-            "same_lane_fraction",
             "waiting_duration_s",
             "stopped_duration_s",
             "config"
@@ -104,7 +105,7 @@
 			{
 			  "id": "conflicting_actor_present",
 			  "type": "expression",
-			  "expr": "path_relationship == 'merge' || path_relationship == 'crossing' || path_relationship == 'shared_junction'"
+			  "expr": "shared_junction == true || common_merge_count > 0 || common_diverge_count > 0"
 			},
 			{
 			  "id": "gap_opened_after_wait",
@@ -112,19 +113,14 @@
 			  "expr": "waiting_duration_s > 0 && separation_after_event > 0"
 			},
 			{
-			  "id": "is_highway_merge",
+			  "id":  "merge_topology",
 			  "type": "expression",
-			  "expr": "path_relationship == 'merge'"
+			  "expr": "common_merge_count > 0"
 			},
 			{
-			  "id": "is_left_turn_conflict",
+			  "id": "diverge_topology",
 			  "type": "expression",
-			  "expr": "path_relationship == 'crossing' && shared_junction == true"
-			},
-			{
-			  "id": "is_roundabout_conflict",
-			  "type": "expression",
-			  "expr": "path_relationship == 'shared_junction'"
+			  "expr": "common_diverge_count > 0"
 			},
 			{
 			  "id": "near_miss_score",
@@ -165,7 +161,7 @@
                     {
                         "if": "event.type == 'lane_change' && event.features.max_lateral_rate > config.aggressive_lateral_rate",
                         "then": {
-                            "tag": "aggressive_lateral",
+                            "tag": "aggressive_lane_change",
                             "timeline": {
                                 "axis": "lateral",
                                 "pattern": "impulsive",
@@ -182,7 +178,7 @@
                     {
                         "if": "event.type == 'lane_change' && event.features.max_lateral_rate < config.smooth_lateral_rate",
                         "then": {
-                            "tag": "smooth_lateral",
+                            "tag": "smooth_lane_change",
                             "timeline": {
                                 "axis": "lateral",
                                 "pattern": "gradual",
@@ -197,7 +193,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'lane_change' && event.features.min_dist < config.cut_in_distance_m && interaction_lateral_cross > 0 && path_relationship != 'independent' && path_relationship != 'unknown'",
+                        "if": "event.type == 'lane_change' && event.features.min_dist < config.cut_in_distance_m && interaction_lateral_cross > 0 && conflicting_actor_present == true",
                         "then": {
                             "interaction": {
                                 "type": "cut_in",
@@ -215,7 +211,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && interaction_convergence > config.merge_convergence_threshold && (path_relationship == 'merge' || path_relationship == 'crossing' || path_relationship == 'shared_junction')",
+                        "if": "event.type == 'proximity' && interaction_convergence > config.merge_convergence_threshold && conflicting_actor_present == true",
                         "then": {
                             "interaction": {
                                 "type": "merge",
@@ -269,7 +265,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && shared_junction == true && (path_relationship == 'crossing' || path_relationship == 'shared_junction')",
+                        "if": "event.type == 'proximity' && shared_junction == true",
                         "then": {
                             "interaction": {
                                 "type": "junction_crossing_interaction",
@@ -299,7 +295,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && shared_junction == true && (path_relationship == 'crossing' || path_relationship == 'shared_junction') && min_ttc > config.cooperative_ttc_threshold && separation_after_event > 0",
+                        "if": "event.type == 'proximity' && shared_junction == true && min_ttc > config.cooperative_ttc_threshold && separation_after_event > 0",
                         "then": {
                             "interaction": {
                                 "type": "cooperative_junction_crossing",
@@ -310,14 +306,14 @@
                 ]
             },
             {
-                "id": "multi_stage_lane_positioning",
+                "id": "trace_multi_stage_lane_positioning",
                 "type": "decision",
                 "conditions": [
                     {
                         "if": "actor.lane_shift_count >= config.multi_stage_lane_change_count && actor.path_complexity >= config.path_complexity_threshold",
                         "then": {
                             "behavior": {
-                                "type": "multi_stage_lane_positioning",
+                                "type": "trace_multi_stage_lane_positioning",
                                 "actor": "actor.id"
                             }
                         }
@@ -325,14 +321,14 @@
                 ]
             },
             {
-                "id": "complex_route_navigation",
+                "id": "trace_complex_route_navigation",
                 "type": "decision",
                 "conditions": [
                     {
                         "if": "actor.path_region_count >= config.complex_path_region_count",
                         "then": {
                             "behavior": {
-                                "type": "complex_route_navigation",
+                                "type": "trace_complex_route_navigation",
                                 "actor": "actor.id"
                             }
                         }
@@ -340,14 +336,14 @@
                 ]
             },
             {
-                "id": "connector_navigation",
+                "id": "trace_connector_navigation",
                 "type": "decision",
                 "conditions": [
                     {
                         "if": "actor.connector_transitions >= config.connector_navigation_threshold",
                         "then": {
                             "behavior": {
-                                "type": "connector_navigation",
+                                "type": "trace_connector_navigation",
                                 "actor": "actor.id"
                             }
                         }
@@ -374,7 +370,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && same_lane_fraction > config.same_lane_following_fraction && proximity_level < config.dangerous_headway_m",
+                        "if": "event.type == 'proximity' && shared_lane_fraction > config.same_lane_following_fraction && proximity_level < config.dangerous_headway_m",
                         "then": {
                             "interaction": {
                                 "type": "dangerous_following",
@@ -389,7 +385,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && same_lane_fraction > config.same_lane_following_fraction && event.features.mean_dist < config.following_headway_m",
+                        "if": "event.type == 'proximity' && shared_lane_fraction > config.same_lane_following_fraction && event.features.mean_dist < config.following_headway_m",
                         "then": {
                             "interaction": {
                                 "type": "car_following",
@@ -407,7 +403,7 @@
                         "if": "event.type == 'proximity' && event.features.min_dist < config.critical_distance_m && min_ttc < config.near_miss_ttc_s && interaction_convergence > config.near_miss_convergence_threshold",
                         "then": {
                             "interaction": {
-                                "type": "near_miss",
+                                "type": "near_miss_longitudinal",
                                 "risk": "high"
                             }
                         }
@@ -422,7 +418,7 @@
                         "if": "event.type == 'proximity' && proximity_level < config.critical_distance_m && event.features.max_lateral_rate > config.near_miss_lateral_rate",
                         "then": {
                             "interaction": {
-                                "type": "near_miss",
+                                "type": "near_miss_lateral",
                                 "timeline": {
                                     "axis": "combined",
                                     "pattern": "evasive"
@@ -472,7 +468,7 @@
                         "if": "actor.lane_shift_count > config.erratic_lane_change_count",
                         "then": {
                             "behavior": {
-                                "type": "unstable_lane_behavior",
+                                "type": "trace_unstable_lane_behavior",
                                 "actor": "actor.id"
                             }
                         }
@@ -511,42 +507,14 @@
 			  ]
 			},
 			{
-			  "id": "waiting_for_roundabout_entry",
-			  "type": "decision",
-			  "conditions": [
-				{
-				  "if": "event.type == 'waiting' && is_roundabout_conflict == true && waiting_duration_s > config.roundabout_wait_duration_s",
-				  "then": {
-					"interaction": {
-					  "type": "waiting_for_roundabout_entry"
-					}
-				  }
-				}
-			  ]
-			},
-			{
 			  "id": "waiting_for_merge_gap",
 			  "type": "decision",
 			  "conditions": [
 				{
-				  "if": "event.type == 'waiting' && is_highway_merge == true && waiting_duration_s > config.merge_wait_duration_s",
+				  "if": "event.type == 'waiting' && merge_topology == true && waiting_duration_s > config.merge_wait_duration_s",
 				  "then": {
 					"interaction": {
 					  "type": "waiting_for_merge_gap"
-					}
-				  }
-				}
-			  ]
-			},
-			{
-			  "id": "waiting_for_left_turn_gap",
-			  "type": "decision",
-			  "conditions": [
-				{
-				  "if": "event.type == 'waiting' && is_left_turn_conflict == true && waiting_duration_s > config.left_turn_wait_duration_s",
-				  "then": {
-					"interaction": {
-					  "type": "waiting_for_left_turn_gap"
 					}
 				  }
 				}

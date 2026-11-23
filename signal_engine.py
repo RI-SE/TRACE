@@ -13,7 +13,10 @@ CONTEXT_SCHEMA = {
         "ready": {"type": "boolean"},
         "context_version": {
             "type": "string",
-            "const": "timeline_v2"
+            "enum": [
+                "timeline_v2",
+                "map_scenario_context_v1"
+            ]
         },
         "duration_seconds": {
             "type": "number",
@@ -98,7 +101,8 @@ CONTEXT_SCHEMA = {
 }
 
 
-CONTEXT_VERSION = "timeline_v2"
+LEGACY_CONTEXT_VERSION = "timeline_v2"
+MAP_SCENARIO_CONTEXT_VERSION = "map_scenario_context_v1"
 
 REQUIRED_TOP_LEVEL = {
     "ready": bool,
@@ -150,7 +154,29 @@ def _dbg(msg, data=None):
 def validate_context(ctx: dict):
     if not isinstance(ctx, dict):
         raise RuntimeError("Context must be dict")
+    #
+    # MapScenarioContext
+    #
+    if ctx.get("kind") == "map_scenario_context":
 
+        required = (
+            "actors",
+            "interaction_topology",
+            "scope"
+        )
+
+        missing = [
+            k for k in required
+            if k not in ctx
+        ]
+
+        if missing:
+            raise RuntimeError(
+                "Missing MapScenarioContext fields: "
+                + ", ".join(missing)
+            )
+
+        return True
     errors = list(_VALIDATOR.iter_errors(ctx))
     if errors:
         raise RuntimeError(f"Schema validation failed: {errors[0].message}")
@@ -202,71 +228,248 @@ def _normalize_world(world):
 
     return {"x": float("nan"), "y": float("nan")}
 
-def normalize_context(ctx: dict):
+def normalize_context(ctx):
+
     if not ctx:
         return ctx
 
     if "context_version" not in ctx:
-        _dbg("[FIX] injecting context_version")
-        ctx["context_version"] = "timeline_v2"
 
-    if "duration_seconds" not in ctx or not ctx.get("duration_seconds"):
-        _dbg("[FIX] injecting default duration_seconds")
+        if ctx.get("kind") == "map_scenario_context":
+            ctx["context_version"] = (
+                "map_scenario_context_v1"
+            )
+        else:
+            ctx["context_version"] = (
+                "timeline_v2"
+            )
+
+    if (
+        "duration_seconds" not in ctx
+        or
+        not ctx.get("duration_seconds")
+    ):
         ctx["duration_seconds"] = 1.0
-    
 
-    # ---------- keys → int ----------
-    for vid in ("V1", "V2"):
-        tl = ctx["vehicles"][vid].get("timeline", {})
-        ctx["vehicles"][vid]["timeline"] = {
-            int(k): v for k, v in tl.items()
+    #
+    # ==================================================
+    # MapScenarioContext v1
+    # ==================================================
+    #
+    if ctx.get("kind") == "map_scenario_context":
+
+        actors = ctx.setdefault(
+            "actors",
+            {}
+        )
+
+        for actor in ("A", "B"):
+
+            actor_ctx = actors.get(
+                actor,
+                {}
+            )
+
+            timeline = actor_ctx.get(
+                "timeline",
+                {}
+            )
+
+            norm = {}
+
+            for k, frame in timeline.items():
+
+                frame = dict(frame)
+
+                frame["world"] = (
+                    _normalize_world(
+                        frame.get("world")
+                    )
+                )
+
+                sd = frame.get("sd") or {}
+
+                frame["sd"] = {
+                    "s": float(
+                        sd.get(
+                            "s",
+                            float("nan")
+                        )
+                    ),
+                    "d": float(
+                        sd.get(
+                            "d",
+                            float("nan")
+                        )
+                    )
+                }
+
+                norm[int(k)] = frame
+
+            actor_ctx["timeline"] = norm
+            actors[actor] = actor_ctx
+
+        interaction = ctx.setdefault(
+            "interaction_facts",
+            {}
+        )
+
+        timeline = interaction.get(
+            "timeline",
+            {}
+        )
+
+        interaction["timeline"] = {
+            int(k): v
+            for k, v in timeline.items()
         }
 
-    pt = ctx["pair"].get("timeline", {})
+        n = len(
+            actors.get("A", {})
+                  .get("timeline", {})
+        )
+
+        ctx.setdefault(
+            "meta",
+            {}
+        )
+
+        ctx["meta"]["frame_count"] = n
+
+        if (
+            n >= 2
+            and
+            ctx["duration_seconds"] > 0
+        ):
+            ctx["meta"]["dt"] = (
+                ctx["duration_seconds"]
+                /
+                (n - 1)
+            )
+
+        return ctx
+
+    #
+    # ==================================================
+    # Legacy timeline_v2
+    # ==================================================
+    #
+    for vid in ("V1", "V2"):
+
+        tl = (
+            ctx["vehicles"][vid]
+            .get("timeline", {})
+        )
+
+        ctx["vehicles"][vid][
+            "timeline"
+        ] = {
+            int(k): v
+            for k, v in tl.items()
+        }
+
+    pt = ctx["pair"].get(
+        "timeline",
+        {}
+    )
+
     ctx["pair"]["timeline"] = {
-        int(k): v for k, v in pt.items()
+        int(k): v
+        for k, v in pt.items()
     }
 
-    # ---------- world normalization ----------
     for vid in ("V1", "V2"):
-        for f in ctx["vehicles"][vid]["timeline"].values():
-            f["world"] = _normalize_world(f.get("world"))
 
-    # ---------- sd normalization ----------
-    for vid in ("V1", "V2"):
-        for f in ctx["vehicles"][vid]["timeline"].values():
+        for f in (
+            ctx["vehicles"][vid]
+            ["timeline"]
+            .values()
+        ):
+
+            f["world"] = (
+                _normalize_world(
+                    f.get("world")
+                )
+            )
+
             sd = f.get("sd") or {}
+
             f["sd"] = {
-                "s": float(sd.get("s", float("nan"))),
-                "d": float(sd.get("d", float("nan")))
+                "s": float(
+                    sd.get(
+                        "s",
+                        float("nan")
+                    )
+                ),
+                "d": float(
+                    sd.get(
+                        "d",
+                        float("nan")
+                    )
+                )
             }
 
-    # ---------- align timelines ----------
     v1 = ctx["vehicles"]["V1"]["timeline"]
     v2 = ctx["vehicles"]["V2"]["timeline"]
-    p  = ctx["pair"]["timeline"]
+    p = ctx["pair"]["timeline"]
 
-    common = sorted(set(v1) & set(v2) & set(p))
+    common = sorted(
+        set(v1) &
+        set(v2) &
+        set(p)
+    )
 
-    ctx["vehicles"]["V1"]["timeline"] = {k: v1[k] for k in common}
-    ctx["vehicles"]["V2"]["timeline"] = {k: v2[k] for k in common}
-    ctx["pair"]["timeline"] = {k: p[k] for k in common}
+    ctx["vehicles"]["V1"]["timeline"] = {
+        k: v1[k]
+        for k in common
+    }
 
-    # ---------- NaN normalization (pair) ----------
-    for f in ctx["pair"]["timeline"].values():
-        for m in ("distance", "delta_s", "delta_d"):
-            val = f.get(m)
-            if not isinstance(val, (int, float)):
+    ctx["vehicles"]["V2"]["timeline"] = {
+        k: v2[k]
+        for k in common
+    }
+
+    ctx["pair"]["timeline"] = {
+        k: p[k]
+        for k in common
+    }
+
+    for f in (
+        ctx["pair"]["timeline"]
+        .values()
+    ):
+
+        for m in (
+            "distance",
+            "delta_s",
+            "delta_d"
+        ):
+
+            if not isinstance(
+                f.get(m),
+                (int, float)
+            ):
                 f[m] = float("nan")
 
-    # ---------- duration meta ----------
     n = len(common)
-    dur = ctx.get("duration_seconds", 0)
 
-    if n >= 2 and dur > 0:
-        ctx.setdefault("meta", {})
-        ctx["meta"]["dt"] = dur / (n - 1)
-        ctx["meta"]["frame_count"] = n
+    ctx.setdefault(
+        "meta",
+        {}
+    )
+
+    ctx["meta"]["frame_count"] = n
+
+    if (
+        n >= 2
+        and
+        ctx["duration_seconds"] > 0
+    ):
+        ctx["meta"]["dt"] = (
+            ctx["duration_seconds"]
+            /
+            (n - 1)
+        )
 
     return ctx
 

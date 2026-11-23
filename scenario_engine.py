@@ -273,90 +273,16 @@ def _extract_window_features(ctx, t_start, t_end, actor=None):
 # TOPOLOGY RESOLVER (ENGINE-ONLY SEMANTICS)
 # ============================================================
 
-def enrich_with_topology(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Inject topology-derived semantics into context.
-
-    SAFE:
-    - Does not overwrite existing fields
-    - Adds under ctx['topology']
-    - Fully optional usage by rules
-    """
-
-    if not isinstance(ctx, dict):
-        return ctx
-
-    meta = ctx.get("meta") or {}
-    vehicles = ctx.get("vehicles") or {}
-
-    def _safe_path(v):
-        if not isinstance(v, dict):
-            return []
-        return v.get("path") or []
-
-
-    v1_path = _safe_path(vehicles.get("V1")) or _safe_path(vehicles.get("v1"))
-    v2_path = _safe_path(vehicles.get("V2")) or _safe_path(vehicles.get("v2"))
-
-    topo = {
-        "v1_path_valid": True,
-        "v2_path_valid": True,
-        "v1_unexpected_lane_change": False,
-        "v2_unexpected_lane_change": False,
-    }
-
-    try:
-        if meta and v1_path:
-            topo["v1_path_valid"] = is_path_topologically_valid(v1_path, meta)
-            topo["v1_unexpected_lane_change"] = is_unexpected_lane_change(v1_path, meta)
-
-        if meta and v2_path:
-            topo["v2_path_valid"] = is_path_topologically_valid(v2_path, meta)
-            topo["v2_unexpected_lane_change"] = is_unexpected_lane_change(v2_path, meta)
-
-    except Exception:
-        # Never break pipeline
-        pass
-
-    topo["v1_role_path"] = (
-        extract_semantic_role_sequence(
-            vehicles.get("V1", {}),
-            meta
-        )
+def enrich_with_topology(ctx):
+    ctx.setdefault(
+        "route_semantics",
+        {}
     )
-
-    topo["v2_role_path"] = (
-        extract_semantic_role_sequence(
-            vehicles.get("V2", {}),
-            meta
-        )
+    ctx.setdefault(
+        "interaction_topology",
+        {}
     )
-    ctx["topology"] = topo
     return ctx
-
-
-def expand_region_to_lanes(rid: int, meta: Dict[str, Any]) -> Set[int]:
-    """
-    Expand a region ID into concrete lanes.
-    Handles overlap semantics safely.
-    """
-    if rid is None or not meta:
-        return set()
-
-    entry = meta.get(str(rid))
-    if not isinstance(entry, dict):
-        return {rid}
-
-    if entry.get("type") == "overlap":
-        out = set()
-        for m in entry.get("members", []) or []:
-            try:
-                out.add(int(m))
-            except Exception:
-                continue
-        return out or {rid}
-
-    return {rid}
 
 
 
@@ -430,55 +356,6 @@ def is_valid_topology_transition(
     return False
 
 
-def is_path_topologically_valid(path: List[int], meta: Dict[str, Any]) -> bool:
-    """
-    Validates path continuity using overlap + adjacency semantics.
-    """
-    if not path or not meta:
-        return True  # do not break existing flows
-
-    reach = build_reachability_graph(meta)
-    expanded = [expand_region_to_lanes(r, meta) for r in path]
-
-    for i in range(len(expanded) - 1):
-
-        if expanded[i] == expanded[i + 1]:
-            continue
-
-        if not is_valid_topology_transition(
-            expanded[i],
-            expanded[i + 1],
-            meta,
-            reach
-        ):
-            return False
-
-    return True
-
-
-def is_unexpected_lane_change(path: List[int], meta: Dict[str, Any]) -> bool:
-    """
-    Detect lane changes that are not structurally required.
-    (Non-breaking: fallback to existing logic if meta missing)
-    """
-    if not path or not meta:
-        return False
-
-    # If path is invalid → unexpected
-    if not is_path_topologically_valid(path, meta):
-        return True
-
-    # Fallback to existing transition logic
-    for i in range(len(path) - 1):
-        try:
-            if _is_lane_change_transition(path[i], path[i+1], meta):
-                return True
-        except Exception:
-            continue
-
-    return False    
-
-
 def compute_headway_sd(v1_sd, v2_sd):
     gaps = [
         abs(p2.get("s_global", p2.get("s"))-p1.get("s_global", p1.get("s")))
@@ -498,79 +375,7 @@ def compute_headway_sd(v1_sd, v2_sd):
 # ============================================================
 # geometry & sampling
 # ============================================================
-def extract_semantic_role_sequence(
-        vehicle,
-        meta):
 
-    seq = []
-
-    tl = vehicle.get(
-        "timeline",
-        {}
-    )
-
-    for _, frame in sorted(
-        tl.items(),
-        key=lambda x: int(x[0])
-    ):
-
-        rid = frame.get(
-            "region_id"
-        )
-
-        if rid is None:
-            continue
-
-        entry = meta.get(
-            str(rid),
-            {}
-        )
-
-        role = []
-
-        if entry.get(
-            "is_connecting_road"
-        ):
-            role.append(
-                "CONNECTOR"
-            )
-
-        if entry.get(
-            "junction_id"
-        ) is not None:
-            role.append(
-                "JUNCTION"
-            )
-
-        pred = entry.get(
-            "predecessors",
-            []
-        ) or []
-
-        succ = entry.get(
-            "successors",
-            []
-        ) or []
-
-        if len(pred) == 0:
-            role.append("ENTRY")
-
-        if len(succ) == 0:
-            role.append("EXIT")
-
-        if not role:
-            role.append("FLOW")
-
-        tag = "|".join(role)
-
-        if (
-            not seq
-            or
-            seq[-1] != tag
-        ):
-            seq.append(tag)
-
-    return seq
 def extract_region_sequence(vehicle):
 
     tl = vehicle.get("timeline", {})
@@ -732,63 +537,6 @@ def sanitize_ttc(ttc):
 
     return float(ttc)
 
-def classify_path_relationship(v1_path, v2_path, meta, depth=3):
-
-    if not v1_path or not v2_path:
-        return "unknown"
-
-    d1 = build_path_descriptor(v1_path, meta)
-    d2 = build_path_descriptor(v2_path, meta)
-
-    shared = d1["lanes"] & d2["lanes"]
-
-    if shared:
-
-        overlap_ratio = (
-            len(shared)
-            /
-            max(
-                1,
-                min(
-                    len(d1["lanes"]),
-                    len(d2["lanes"])
-                )
-            )
-        )
-
-        if overlap_ratio > 0.8:
-            return "same_lane"
-
-        return "shared_path"
-
-    if d1["overlaps"] & d2["overlaps"]:
-        return "crossing"
-
-    for lane in d1["lanes"]:
-        if _get_adjacent(meta, lane) & d2["lanes"]:
-            return "adjacent_flow"
-
-    if d1["junctions"] & d2["junctions"]:
-        return "shared_junction"
-
-    reach = build_reachability_graph(meta)
-
-    reachable1 = get_reachable(
-        d1["lanes"],
-        reach,
-        max_depth=depth
-    )
-
-    reachable2 = get_reachable(
-        d2["lanes"],
-        reach,
-        max_depth=depth
-    )
-
-    if reachable1 & reachable2:
-        return "merge"
-
-    return "independent"
 
 
 # ============================================================
@@ -854,56 +602,6 @@ def compute_speeds(sd):
         for p0, p1 in zip(sd[:-1], sd[1:])
     ]
 
-def classify_path_semantics(v1_path, v2_path, meta, depth=3):
-
-    d1 = build_path_descriptor(v1_path, meta)
-    d2 = build_path_descriptor(v2_path, meta)
-
-    reach = build_reachability_graph(meta)
-
-    shared_lane = bool(
-        d1["lanes"] & d2["lanes"]
-    )
-
-    crossing = bool(
-        d1["overlaps"] & d2["overlaps"]
-    )
-
-    adjacent = False
-
-    for lane in d1["lanes"]:
-        if _get_adjacent(meta, lane) & d2["lanes"]:
-            adjacent = True
-            break
-
-    shared_junction = bool(
-        d1["junctions"] & d2["junctions"]
-    )
-
-    merge = False
-
-    r1 = get_reachable(
-        d1["lanes"],
-        reach,
-        depth
-    )
-
-    r2 = get_reachable(
-        d2["lanes"],
-        reach,
-        depth
-    )
-
-    if r1 & r2:
-        merge = True
-
-    return {
-        "shared_lane": shared_lane,
-        "crossing": crossing,
-        "adjacent_flow": adjacent,
-        "shared_junction": shared_junction,
-        "merge": merge
-    }
 
 def load_templates(path="scenario_gorules.json") -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -913,7 +611,25 @@ def load_templates(path="scenario_gorules.json") -> dict:
 
 
 def extract_sd_sequences(ctx: dict):
-    vehicles = ctx.get("vehicles", {})
+    actors = ctx.get(
+        "actors",
+        {}
+    )
+
+    vehicles = {
+
+        "V1":
+            actors.get(
+                "A",
+                {}
+            ),
+
+        "V2":
+            actors.get(
+                "B",
+                {}
+            )
+    }
     out = {}
 
     for vid in ("V1", "V2"):
@@ -1215,14 +931,24 @@ def enrich_with_signal_metrics(ctx: dict) -> dict:
     if not isinstance(ctx, dict):
         return {}
 
-    ctx.setdefault("vehicles", {})
-    ctx.setdefault("pairwise", {})
     ctx.setdefault("derived", {})
 
     signals = ctx.setdefault("derived", {}).setdefault("signals", {})
     engine = ctx.setdefault("derived", {}).setdefault("engine", {})
 
-    vehicles = ctx["vehicles"]
+    actors = ctx.get(
+        "actors",
+        {}
+    )
+
+    vehicles = {
+
+        "V1":
+            actors.get("A", {}),
+
+        "V2":
+            actors.get("B", {})
+    }
 
     v1 = vehicles.get("V1", {})
     v2 = vehicles.get("V2", {})
@@ -1292,50 +1018,27 @@ def enrich_with_signal_metrics(ctx: dict) -> dict:
 
     #  derive counts from events (SINGLE SOURCE OF TRUTH)
 
-    vehicles["V1"].setdefault("derived", {})
-    vehicles["V2"].setdefault("derived", {})
-    v1_count = len(lc_events_v1)
-    v2_count = len(lc_events_v2)
-
-    vehicles["V1"]["derived"]["lane_change_count"] = v1_count
-    vehicles["V2"]["derived"]["lane_change_count"] = v2_count
-
-    vehicles["V1"]["derived"]["lane_change"] = v1_count > 0
-    vehicles["V2"]["derived"]["lane_change"] = v2_count > 0
-    
-    # build path from timeline if missing
-    if not v1.get("path"):
-        v1["path"] = extract_region_sequence(v1).get("sequence", [])
-
-    if not v2.get("path"):
-        v2["path"] = extract_region_sequence(v2).get("sequence", [])
-    # -------------------------
-    # path relation
-    # -------------------------
-    rel = classify_path_relationship(
-        v1.get("path", []),
-        v2.get("path", []),
-        ctx.get("meta", {}),
-        depth=int(
-            cfg_get(
-                ctx,
-                "topology_reachability_depth",
-                3
-            )
-        )
+    ctx.setdefault(
+        "derived",
+        {}
     )
-    signals["path_relationship"] = rel
-    signals["path_semantics"] = classify_path_semantics(
-        v1.get("path", []),
-        v2.get("path", []),
-        ctx.get("meta", {}),
-        depth=int(
-            cfg_get(
-                ctx,
-                "topology_reachability_depth",
-                3
-            )
-        )
+
+    engine["lane_change_events"] = (
+        lc_events_v1 +
+        lc_events_v2
+    )
+
+    ctx.setdefault("derived", {})
+
+    ctx["derived"]["v1_lane_change_count"] = len(lc_events_v1)
+    ctx["derived"]["v2_lane_change_count"] = len(lc_events_v2)
+
+    ctx["derived"]["v1_lane_change"] = (
+        len(lc_events_v1) > 0
+    )
+
+    ctx["derived"]["v2_lane_change"] = (
+        len(lc_events_v2) > 0
     )
 
     return ctx
@@ -1485,130 +1188,90 @@ def _resolve_conflicts(rules: List[RuleEntry], config: dict) -> List[RuleEntry]:
     return filtered
 
 
+def build_empty_engine_context(
+        map_ctx):
+
+    return {
+
+        "kind":
+            "engine_context",
+
+        "version":
+            "1.0",
+
+        "source_kind":
+            map_ctx.get(
+                "kind"
+            ),
+
+        "map_context":
+            map_ctx,
+
+        "facts": {},
+
+        "rule_inputs": {},
+
+        "events": [],
+
+        "behaviors": [],
+
+        "insights": []
+    }
 
 def build_engine_insight_context(
     v1=None,
     v2=None,
     duration: float = 0.0,
     *,
-    context: dict | None = None,
-    **kwargs,
-) -> dict:
-    """
-    STRICT mode context builder.
-
-    - Accepts ONLY unified emitted context
-    - Performs validation + minimal augmentation
-    - DOES NOT reconstruct trajectories or topology
-    """
+    context=None,
+    **kwargs
+):
 
     if not isinstance(context, dict):
-        raise ValueError("build_engine_insight_context requires a unified context dict")
+        raise ValueError(
+            "MapScenarioContext required"
+        )
+
+    if context.get("kind") != (
+        "map_scenario_context"
+    ):
+        raise ValueError(
+            "Expected map_scenario_context"
+        )
 
     if not context.get("ready"):
-        raise ValueError("Context is not marked as ready")
+        raise ValueError(
+            "Context not ready"
+        )
 
-    # ------------------------------------------------------------------
-    #  Deep copy to avoid accidental mutation
-    # ------------------------------------------------------------------
     ctx = copy.deepcopy(context)
 
-    # ------------------------------------------------------------------
-    #  Ensure required top-level structure
-    # ------------------------------------------------------------------
-    ctx.setdefault("vehicles", {})
-    ctx.setdefault("pairwise", {})
+    actors = ctx.get(
+        "actors",
+        {}
+    )
+
+    if "A" not in actors:
+        raise ValueError(
+            "Actor A missing"
+        )
+
+    if "B" not in actors:
+        raise ValueError(
+            "Actor B missing"
+        )
+
     ctx.setdefault("derived", {})
-
-    # ------------------------------------------------------------------
-    #  Normalize vehicle entries
-    # ------------------------------------------------------------------
-    for vid in ("V1", "V2"):
-        veh = ctx["vehicles"].setdefault(vid, {})
-
-        veh.setdefault("timeline", {})
-        veh.setdefault("trajectory", [])
-        veh.setdefault("derived", {})
-
-    # ------------------------------------------------------------------
-    #  Normalize pairwise timeline
-    # ------------------------------------------------------------------
-    ctx["pairwise"].setdefault("timeline", {})
-
-    # ------------------------------------------------------------------
-    #  Ensure derived sub-structures
-    # ------------------------------------------------------------------
-    ctx["derived"].setdefault("signals", {})
-    ctx["derived"].setdefault("engine", {})
-
-    # ------------------------------------------------------------------
-    #  Duration handling
-    # ------------------------------------------------------------------
-    if duration and duration > 0:
-        ctx["duration_seconds"] = float(duration)
-    else:
-        ctx.setdefault("duration_seconds", 0.0)
+    ctx = enrich_with_signal_metrics(ctx)
+    rule_inputs = _derive_rule_inputs(ctx)
+    ctx["derived"]["rule_inputs"] = rule_inputs
+    ctx.update(rule_inputs)
 
     return ctx
 # ============================================================
 # Events 
 # ============================================================
-def build_topology_events(ctx):
 
-    events = []
-
-    topo = ctx.get(
-        "topology",
-        {}
-    )
-
-    for actor, key in (
-        ("vehicle1", "v1_role_path"),
-        ("vehicle2", "v2_role_path")
-    ):
-
-        path = topo.get(
-            key,
-            []
-        )
-
-        if not path:
-            continue
-
-        if any(
-            "ENTRY" in x
-            for x in path
-        ):
-            events.append({
-                "type":
-                    "topology_entry",
-                "participants":
-                    [actor]
-            })
-
-        if any(
-            "CONNECTOR" in x
-            for x in path
-        ):
-            events.append({
-                "type":
-                    "topology_connector",
-                "participants":
-                    [actor]
-            })
-
-        if any(
-            "EXIT" in x
-            for x in path
-        ):
-            events.append({
-                "type":
-                    "topology_exit",
-                "participants":
-                    [actor]
-            })
-
-    return events
 
 def detect_events(ctx, events=None):
     events = list(events) if events else []
@@ -1662,15 +1325,7 @@ def detect_events(ctx, events=None):
     # --------------------------------------------------
     # MERGED PROXIMITY EVENTS (segment-based)
     # --------------------------------------------------
-    same_lane_fraction = ctx.get("same_lane_fraction", 0.0)
-    path_relationship = ctx.get("path_relationship")
     pair_ts = e.get("pair_time_series", [])
-
-    if (
-        same_lane_fraction <= 0.0
-        and _is_non_interactive_relation(path_relationship)
-    ):
-        return events
 
     active_start = None
     active_points = []
@@ -2182,12 +1837,14 @@ class GoRulesEngine:
 
             if actor_id == "vehicle1":
                 lane_shift_count = (
-                    ctx.get("vehicles", {})
-                    .get("V1", {})
-                    .get("derived", {})
-                    .get("lane_change_count", 0)
+                    ctx.get(
+                        "derived",
+                        {}
+                    ).get(
+                        "v1_lane_change_count",
+                        0
+                    )
                 )
-                
                 actor_path_complexity = ctx.get("v1_path_complexity", 0)
                 actor_region_count = ctx.get(
                     "v1_path_region_count",
@@ -2200,10 +1857,13 @@ class GoRulesEngine:
 
             elif actor_id == "vehicle2":
                 lane_shift_count = (
-                    ctx.get("vehicles", {})
-                    .get("V2", {})
-                    .get("derived", {})
-                    .get("lane_change_count", 0)
+                    ctx.get(
+                        "derived",
+                        {}
+                    ).get(
+                        "v2_lane_change_count",
+                        0
+                    )
                 )
                 actor_path_complexity = ctx.get("v2_path_complexity", 0)
                 actor_region_count = ctx.get(
@@ -2332,119 +1992,200 @@ def _derive_rule_inputs(ctx: dict) -> dict:
     )
 
     ttc_values = []
-
     if isinstance(pair_tl, dict):
         for frame in pair_tl.values():
             ttc = frame.get("ttc_s")
-            if isinstance(ttc, (int, float)) and math.isfinite(ttc):
-                clean_ttc = sanitize_ttc(ttc)
-                if clean_ttc is not None:
-                    ttc_values.append(clean_ttc)
+            if not isinstance(
+                ttc,
+                (int, float)
+            ):
+                continue
+            if not math.isfinite(ttc):
+                continue
+            if ttc <= 0:
+                continue
+            if ttc > 60:
+                continue
+            ttc_values.append(
+                float(ttc)
+            )
 
-    path_relationship = (
-        ctx.get("path_relationship")
-        or
-        ctx.get("derived", {})
-        .get("signals", {})
-        .get("path_relationship")
-        or "unknown"
+    interaction_topology = (
+        ctx.get(
+            "interaction_topology",
+            {}
+        )
+    )
+
+    pair_tl = (
+        ctx.get(
+            "interaction_facts",
+            {}
+        ).get(
+            "timeline",
+            {}
+        )
+    )
+
+    shared_junction = any(
+        (
+            f.get(
+                "lane_relation",
+                {}
+            ).get(
+                "shared_junction",
+                False
+            )
+        )
+        for f in pair_tl.values()
     )
 
     out = {
-        "shared_junction":
-            path_relationship == "shared_junction",
 
-        "path_relationship":
-            path_relationship,
+        "shared_junction":
+            shared_junction,
+        "shared_lane_fraction":
+            float(
+                interaction_topology.get(
+                    "shared_lane_ratio",
+                    0.0
+                )
+            ),
+
+        "common_merge_count":
+            len(
+                interaction_topology.get(
+                    "common_merge_points",
+                    []
+                )
+            ),
+
+        "common_diverge_count":
+            len(
+                interaction_topology.get(
+                    "common_diverge_points",
+                    []
+                )
+            ),
 
         "min_ttc":
             min(ttc_values)
-            if ttc_values else float("inf")
+            if ttc_values
+            else float("inf")
     }
 
 
     # --------------------------------------------------
     # Actor metrics
     # --------------------------------------------------
-    def vehicle_features(vid):
+    def route_semantics_connector_count(transitions):
 
-        vehicle = vehicles.get(vid, {})
-        path = vehicle.get("path") or []
+        return sum(
+            1 for t in transitions
+            if t == "TRANSFER"
+        )
+    def vehicle_features(actor):
 
-        lane_changes = (
-            vehicle.get("derived", {})
-                   .get("lane_change_count", 0)
+        actor_obj = (
+            ctx.get(
+                "actors",
+                {}
+            )
+            .get(actor, {})
         )
 
-        connector_count = sum(
-            1
-            for rid in path
-            if meta.get(str(rid), {}).get("type") == "connecting_lane"
+        route = (
+            actor_obj
+            .get(
+                "route_semantics",
+                {}
+            )
+            .get(
+                "route",
+                []
+            )
+        )
+
+        transitions = (
+            actor_obj
+            .get(
+                "route_semantics",
+                {}
+            )
+            .get(
+                "transitions",
+                []
+            )
+        )
+
+        topo = (
+            actor_obj
+            .get(
+                "topology_facts",
+                {}
+            )
         )
 
         return {
+
             "path_complexity":
-                len(set(path))
-                + lane_changes
-                + connector_count,
+                len(route),
 
             "connector_transitions":
-                connector_count,
-
+                route_semantics_connector_count(
+                    actor_obj.get(
+                        "route_semantics",
+                        {}
+                    ).get(
+                        "transitions",
+                        []
+                    )
+                ),
             "path_region_count":
-                len(path)
+                len(route),
+
+            "junction_count":
+                len(
+                    topo.get(
+                        "junctions",
+                        []
+                    )
+                ),
+
+            "merge_count":
+                len(
+                    topo.get(
+                        "merge_points",
+                        []
+                    )
+                ),
+
+            "diverge_count":
+                len(
+                    topo.get(
+                        "diverge_points",
+                        []
+                    )
+                )
         }
 
-    for vid, prefix in (("V1", "v1"), ("V2", "v2")):
-
-        vf = vehicle_features(vid)
+    for actor, prefix in (("A","v1"), ("B","v2")):
+        vf = vehicle_features(actor)
 
         out[f"{prefix}_path_complexity"] = vf["path_complexity"]
         out[f"{prefix}_connector_transitions"] = vf["connector_transitions"]
         out[f"{prefix}_path_region_count"] = vf["path_region_count"]
+        out[f"{prefix}_merge_count"] = (vf["merge_count"])
+        out[f"{prefix}_diverge_count"] = (vf["diverge_count"])        
 
     # --------------------------------------------------
     # Same lane fraction
     # --------------------------------------------------
-    sd1 = engine.get("v1_sd", [])
-    sd2 = engine.get("v2_sd", [])
-
-    same_lane = 0
-    total = 0
-
-    for p1, p2 in zip(sd1, sd2):
-
-        total += 1
-
-        l1 = expand_region_to_lanes(
-            p1.get("region_id"),
-            meta
+    out["shared_lane_fraction"] = (
+        interaction_topology.get(
+            "shared_lane_ratio",
+            0.0
         )
-
-        l2 = expand_region_to_lanes(
-            p2.get("region_id"),
-            meta
-        )
-        pair_tl = (
-            ctx.get("pairwise", {})
-            .get("timeline", {})
-        )
-
-        frame = pair_tl.get(str(total - 1))
-
-        if isinstance(frame, dict):
-
-            lane_rel = frame.get("lane_relation", {})
-
-            if lane_rel.get("same_lane") is True:
-                same_lane += 1
-
-        else:
-            if l1 and l2 and (l1 & l2):
-                same_lane += 1
-
-    out["same_lane_fraction"] = (
-        same_lane / total if total else 0.0
     )
 
     # --------------------------------------------------
@@ -2460,7 +2201,52 @@ def _derive_rule_inputs(ctx: dict) -> dict:
 
     out["distance_trend"] = distance_trend
     out["separation_after_event"] = max(distance_trend, 0.0)
+    interaction = (
+        _derive_interaction_features(
+            ctx
+        )
+    )
 
+    out.update({
+
+        "interaction_sign_flip":
+            interaction.get(
+                "interaction_sign_flip",
+                0
+            ),
+
+        "interaction_lateral_cross":
+            interaction.get(
+                "interaction_lateral_cross",
+                0
+            ),
+
+        "interaction_convergence":
+            interaction.get(
+                "interaction_convergence",
+                0.0
+            ),
+
+        "waiting_duration_s":
+            interaction.get(
+                "waiting_duration_s",
+                0.0
+            ),
+
+        "distance_min":
+            ctx.get(
+                "derived",
+                {}
+            )
+            .get(
+                "signals",
+                {}
+            )
+            .get(
+                "min_distance",
+                float("inf")
+            )
+    })
     return out
 
 
@@ -2680,7 +2466,6 @@ def suggest_rules_combined(
     )    
     try:
         ctx = enrich_with_topology(ctx)
-        ctx.update(ctx.get("topology", {}))
     except Exception:
         pass
 
@@ -2697,7 +2482,9 @@ def suggest_rules_combined(
     ctx.update(rule_inputs)
 
     interaction = _derive_interaction_features(ctx)
-    ctx.setdefault("interaction", {}).update(interaction)
+    ctx.setdefault("derived",{})
+    ctx["derived"]["interaction_features"] = interaction
+
     ctx.update(interaction)
     # -------------------------
     # Behavioral probabilities
@@ -2776,8 +2563,6 @@ def suggest_rules_combined(
     engine = ctx.get("derived", {}).get("engine", {})
 
     ctx.update(signals)
-    ctx["path_relationship"] = signals.get("path_relationship", "unknown")
-
     ctx["pair_time_series"] = engine.get("pair_time_series", [])
     ctx["lane_change_events"] = engine.get("lane_change_events", [])
 
@@ -2786,12 +2571,6 @@ def suggest_rules_combined(
     # ----------------------------------------------------------
     ctx["derived"]["signals"].update(_compute_instability_signals(ctx))
     ctx.update(ctx["derived"]["signals"])
-
-    # ----------------------------------------------------------
-    # 8. PATH RELATION + GLOBAL SIGNALS (important for GoRules)
-    # ----------------------------------------------------------
-    if "path_relationship" not in ctx:
-        ctx["path_relationship"] = ctx.get("derived", {}).get("signals", {}).get("path_relationship")
 
     # ----------------------------------------------------------
     # 9. EXECUTE GORULES ENGINE
@@ -2884,10 +2663,15 @@ def suggest_rules_combined(
             ctx.get("semantic_event_timeline", [])
         )
 
-        context["interaction"] = copy.deepcopy(
-            ctx.get("interaction", {})
-        )
-
+        context["interaction_features"] = copy.deepcopy(
+                ctx.get(
+                    "derived",
+                    {}
+                ).get(
+                    "interaction_features",
+                    {}
+                )
+            )
         context["behavior"] = copy.deepcopy(
             ctx.get("behavior", {})
         )
@@ -2897,10 +2681,6 @@ def suggest_rules_combined(
             {}
         )["signals"] = copy.deepcopy(
             ctx.get("derived", {}).get("signals", {})
-        )
-
-        context["path_relationship"] = ctx.get(
-            "path_relationship"
         )
 
     except Exception as e:
@@ -2917,6 +2697,59 @@ def suggest_rules_combined(
 
     return unique
 
+def expand_region_to_lanes(
+        region_id,
+        meta):
+
+    if region_id is None:
+        return set()
+
+    try:
+        rid = int(region_id)
+    except Exception:
+        return set()
+
+    entry = meta.get(
+        str(rid),
+        {}
+    )
+
+    if not isinstance(entry, dict):
+        return {rid}
+
+    rtype = entry.get("type")
+
+    #
+    # overlap region
+    #
+    if rtype == "overlap":
+
+        out = set()
+
+        for m in (
+            entry.get("members", [])
+            or []
+        ):
+            try:
+                out.add(int(m))
+            except Exception:
+                pass
+
+        return out or {rid}
+
+    #
+    # normal lane region
+    #
+    if rtype in (
+        "lane",
+        "connecting_lane"
+    ):
+        return {rid}
+
+    #
+    # fallback
+    #
+    return {rid}
 
 def _is_lane_change_transition(
     r_from,
@@ -3406,22 +3239,18 @@ def build_scenario_descriptor(
     motif_map = {
         "lane_change>proximity":
             "LC_PROX",
-
         "waiting>merge":
             "WAIT_MERGE",
-
         "waiting>yield":
             "WAIT_YIELD",
-
         "lane_change>car_following":
             "LC_FOLLOW",
-
         "lane_change>dangerous_following":
             "LC_DANGER_FOLLOW",
-
-        "proximity>near_miss":
+        "proximity>near_miss_longitudinal":
             "PROX_NEAR_MISS",
-
+        "proximity>near_miss_lateral":
+            "PROX_NEAR_MISS",
         "proximity>avoidance":
             "PROX_AVOIDANCE"
     }
@@ -3464,44 +3293,49 @@ def build_scenario_descriptor(
     # TOPOLOGY
     # ==================================================
 
-    path_semantics = (
-        ctx.get("derived", {})
-           .get("signals", {})
-           .get("path_semantics", {})
+    it = ctx.get(
+        "interaction_topology",
+        {}
     )
 
     topology = {
-        "path_relationship":
-            ctx.get("path_relationship"),
 
-        "same_lane_fraction":
-            ctx.get(
-                "same_lane_fraction"
+        "shared_lane_fraction":
+            it.get(
+                "shared_lane_ratio",
+                0.0
             ),
 
-        "shared_lane":
-            path_semantics.get(
-                "shared_lane"
+        "shared_junction_count":
+            len(
+                it.get(
+                    "shared_junctions",
+                    []
+                )
             ),
 
-        "crossing":
-            path_semantics.get(
-                "crossing"
+        "common_merge_count":
+            len(
+                it.get(
+                    "common_merge_points",
+                    []
+                )
             ),
 
-        "adjacent_flow":
-            path_semantics.get(
-                "adjacent_flow"
+        "common_diverge_count":
+            len(
+                it.get(
+                    "common_diverge_points",
+                    []
+                )
             ),
 
-        "shared_junction":
-            path_semantics.get(
-                "shared_junction"
-            ),
-
-        "merge":
-            path_semantics.get(
-                "merge"
+        "shared_route_segments":
+            len(
+                it.get(
+                    "shared_route_segments",
+                    []
+                )
             )
     }
 
@@ -3515,15 +3349,24 @@ def build_scenario_descriptor(
     )
 
     lane_change_count = (
-        ctx.get("vehicles", {})
-           .get("V1", {})
-           .get("derived", {})
-           .get("lane_change_count", 0)
-    ) + (
-        ctx.get("vehicles", {})
-           .get("V2", {})
-           .get("derived", {})
-           .get("lane_change_count", 0)
+
+        ctx.get(
+            "derived",
+            {}
+        ).get(
+            "v1_lane_change_count",
+            0
+        )
+
+        +
+
+        ctx.get(
+            "derived",
+            {}
+        ).get(
+            "v2_lane_change_count",
+            0
+        )
     )
 
     numeric_features = {

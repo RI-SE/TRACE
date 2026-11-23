@@ -1,823 +1,999 @@
-# TRACE Architecture
+# TRACE Architecture Specification
+
+## Purpose
+
+TRACE transforms trajectories and road-network topology into:
+
+- Map-enriched scenario contexts
+- Semantic traffic events
+- Behavioral inferences
+- Human-readable explanations
+- Semantic scenario databases
+- Similarity-search descriptors
+- OpenSCENARIO scenarios
+
+TRACE follows a strict separation between:
+
+- Infrastructure facts
+- Route semantics
+- Traffic events
+- Behavioral interpretations
 
 ---
 
-# System Overview
+# Core Principle
 
-TRACE transforms vehicle trajectories into:
+Infrastructure produces facts.
 
-- Semantic driving scenarios
-- Structured context models
-- Event timelines
-- Behavioral rules
-- Human-understandable explanations
-- Scenario descriptors
-- Similarity-search signatures
-- OpenSCENARIO simulations
+GoRules produces interpretations.
 
-Core philosophy:
+Python should generate context.
 
-```text
-Traffic Data
-    -> Context
-    -> Signals
-    -> Events
-    -> Rules
-    -> Descriptor    
-    -> Explanations
-    -> Simulation
-```
-![TRACE screenshot](./docs/TRACE_screenshot.png)
+GoRules should generate semantics.
+
 ---
 
-# High-Level Architecture
+# Main Data Flow
 
 ```text
-MainApp
-│
-├── LaneMapViewer
-│     ├── RoadInfrastructure
-│     ├── OpenLABEL Import
-│     ├── Manual Trajectories
-│     └── Context Generation
-│
-└── ScenarioRuleGUI
-      ├── Scenario Engine
-      ├── GoRules Engine
-      ├── Explanation Engine
-      └── OpenSCENARIO Export
-```
+OpenLABEL / Trajectories
+            +
+OpenDRIVE
+            +
+Lanelet-Enriched Metadata
+            +
+Homography
+            ↓
 
-Data flow:
-
-```text
-Mask/Layout/OpenDRIVE
-          ↓
 RoadInfrastructure
-          ↓
-Trajectories
-          ↓
-ContextBuilder
-          ↓
-Signal Engine
-          ↓
+            ↓
+
+LaneMapViewer
+            ↓
+
+MapScenarioContext
+            ↓
+
 Scenario Engine
-          ↓
-Event Detection
-          ↓
-GoRules DSL
-          ↓
-Rule Generation
-          ↓
+            ↓
+
+GoRules
+            ↓
+
+Events
+Behaviors
+Insights
+
+            ↓
+
 Scenario Descriptor
-          ↓
-Explanation + Export
+
+            ↓
+      ┌─────────────┬───────────────┬───────────────┐
+      ↓             ↓               ↓
+Similarity    Explanations     OpenSCENARIO
+  Search                           Export
 ```
 
 ---
 
-# Primary Modules
+# Ownership Model
 
 ## MainApp
 
 Responsibilities:
 
-- Connects LaneMapViewer and ScenarioRuleGUI.
-- Routes contexts.
-- Synchronizes duration.
-- Synchronizes masks and metadata.
-- Synchronizes OpenDRIVE paths.
+- Module orchestration
+- Data routing
+- UI coordination
 
-Design rule:
+MainApp performs no semantic reasoning.
 
-- Viewer owns raw data.
-- Scenario GUI owns semantic reasoning.
-- MainApp owns coordination only.
+---
+
+## RoadInfrastructure
+
+Authoritative owner of:
+
+- OpenDRIVE geometry
+- Lanelet-style graph topology
+- Region relationships
+- Junction relationships
+- Routing relationships
+
+RoadInfrastructure provides:
+
+```text
+successors
+predecessors
+adjacent
+shared junctions
+shared future junctions
+merge relationships
+```
+
+Topology knowledge must originate here.
+
+No downstream module should rebuild topology.
 
 ---
 
 ## LaneMapViewer
 
-Viewer and data acquisition layer.
-
-### Supported Inputs
-
-1. Manual waypoint trajectories
-2. OpenLABEL trajectories
-3. Road segmentation masks
-4. Layout metadata
-5. Homography matrices
-6. OpenDRIVE maps
-
-### Major Responsibilities
-
-- Display lane maps
-- Display trajectories
-- Build vehicle contexts
-- Build pairwise contexts
-- Perform similarity search
-- Build semantic databases
-
-### Context Ownership
-
-The viewer creates the authoritative context used by the entire system.
-
-### Viewer Modes
-
-TRACE supports two independent trajectory sources:
-
-#### Manual Mode
-
-User-defined waypoint trajectories.
-
-Workflow:
-
-1. Select V1/V2
-2. Add waypoints
-3. Set Duration and FPS
-4. Press Generate
-5. Press Apply
-
-Changing Duration or FPS marks trajectories as stale and requires regeneration.
-
-#### JSON Mode
-
-OpenLABEL trajectory extraction.
-
-Workflow:
-
-1. Load OpenLABEL
-2. Select frame range
-3. Select V1 and V2
-4. Press Apply
-
-Changing frame range marks trajectory extraction as stale and requires re-Apply.
-
-#### Mode Isolation
-
-Manual trajectories and JSON trajectories are stored independently.
-
-Switching modes:
-- Does not delete trajectories
-- Does not overwrite trajectories from the other mode
-- Preserves contexts per mode
-- Restores the correct visualization automatically
----
-
-## ScenarioRuleGUI
-
-Semantic reasoning layer.
-
-Responsibilities:
-
-- Context ingestion
-- Rule generation
-- Insight generation
-- Rule explanation
-- Scenario export
-- OpenSCENARIO export
-
-Pipeline:
+Authoritative owner of:
 
 ```text
-Context
-  → Engine Enrichment
-  → Event Detection
-  → Rule Evaluation
-  → Explanation
-  → Export
+Trajectory processing
+Projection
+Topology extraction
+Route extraction
+Map context generation
+Semantic database generation
+Similarity indexing
 ```
+
+LaneMapViewer owns map reasoning.
+
+LaneMapViewer does not own traffic behavior logic.
 
 ---
 
-# Canonical Context Model
+## Scenario Engine
 
-Everything in TRACE revolves around a context dictionary.
+Authoritative owner of:
 
-## Required Structure
+```text
+Context ingestion
+Context enrichment
+Rule input preparation
+Descriptor construction
+```
+
+Scenario Engine prepares facts for GoRules.
+
+Scenario Engine should avoid hardcoded traffic behavior logic.
+
+---
+
+## GoRules
+
+Authoritative owner of:
+
+```text
+Traffic events
+Behavior detection
+Insights
+Reasoning
+```
+
+All semantic interpretations should originate from GoRules.
+
+If a new traffic behavior is introduced, it should normally be implemented as a rule rather than Python code.
+
+---
+
+# Context Hierarchy
+
+TRACE uses two different context objects.
+
+---
+
+## 1. MapScenarioContext
+
+Generated by LaneMapViewer.
+
+Contains only map-derived facts.
+
+Consumes:
+
+```text
+trajectories
+road topology
+metadata
+```
+
+Produces:
+
+```text
+route semantics
+topology facts
+interaction facts
+```
+
+This is the primary contract sent to Scenario Engine.
+
+---
+
+## 2. EngineContext
+
+Generated by Scenario Engine and GoRules.
+
+Contains:
+
+```text
+events
+behaviors
+insights
+descriptor
+```
+
+EngineContext is derived from MapScenarioContext.
+
+EngineContext must never be treated as an input source.
+
+---
+
+# Why Scenario-Centric Context
+
+The system reasoner, semantic database, explanations, OpenSCENARIO export and future search all operate on:
+
+```text
+Actor A
++
+Actor B
++
+Coexistence Window
+```
+
+Example:
+
+```text
+Vehicle 17
+Vehicle 42
+Frames 1200-1800
+```
+
+Therefore the primary context unit is a scenario.
+
+Not a full recording.
+
+---
+
+# Dataset vs Scenario
+
+## Dataset
+
+A recording contains many tracked objects.
+
+Example:
+
+```text
+600 vehicles
+30 minutes
+```
+
+Dataset is only a source of scenarios.
+
+Dataset is not the semantic unit.
+
+---
+
+## Scenario
+
+The semantic unit is:
+
+```text
+actor pair
++
+coexistence window
+```
+
+Example:
+
+```text
+Vehicle 21
+Vehicle 77
+Frames 4200-4650
+```
+
+This scenario becomes:
+
+- rule input
+- explanation input
+- semantic DB entry
+- OpenSCENARIO candidate
+- similarity-search candidate
+
+---
+
+# MapScenarioContext Contract
 
 ```python
 {
-  "ready": True,
-  "context_version": "timeline_v2",
-  "duration_seconds": float,
+    "kind": "map_scenario_context",
 
-  "vehicles": {
-      "V1": {...},
-      "V2": {...}
+    "version": "1.0",
+
+    "scope": {...},
+
+    "actors": {...},
+
+    "interaction": {...},
+
+    "meta": {...}
+}
+```
+# MapScenarioContext JSON Schema
+
+The MapScenarioContext is the authoritative contract produced by LaneMapViewer.
+
+It contains only map-derived facts and interaction facts.
+
+It must not contain:
+
+- events
+- behaviors
+- insights
+- descriptor data
+- rule evaluations
+
+Those belong to EngineContext.
+
+---
+
+## Schema
+
+```json
+{
+  "kind": "map_scenario_context",
+  "version": "1.0",
+
+  "scope": {
+    "actor_a": "string",
+    "actor_b": "string",
+
+    "start_frame": 0,
+    "end_frame": 0,
+
+    "duration_seconds": 0.0
   },
 
-  "pair": {
-      "timeline": {...}
+  "actors": {
+
+    "A": {
+
+      "id": "string",
+
+      "timeline": {
+
+        "frame_id": {
+
+          "region_id": "string",
+
+          "world": {
+            "x": 0.0,
+            "y": 0.0
+          },
+
+          "sd": {
+            "s": 0.0,
+            "d": 0.0
+          },
+
+          "topology": [
+            "FLOW"
+          ]
+        }
+      },
+
+      "route_semantics": {
+
+        "route": [
+          "lane_id"
+        ],
+
+        "transitions": [
+          "FOLLOW",
+          "LANE_CHANGE",
+          "DIVERGE",
+          "TRANSFER"
+        ]
+      },
+
+      "topology_facts": {
+
+        "junctions": [
+          "junction_id"
+        ],
+
+        "merge_points": [
+          "lane_id"
+        ],
+
+        "diverge_points": [
+          "lane_id"
+        ]
+      }
+    },
+
+    "B": {
+
+      "id": "string",
+
+      "timeline": {},
+
+      "route_semantics": {},
+
+      "topology_facts": {}
+    }
+  },
+
+  "interaction": {
+
+    "timeline": {
+
+      "frame_id": {
+
+        "distance_m": 0.0,
+
+        "delta_s": 0.0,
+
+        "delta_d": 0.0,
+
+        "relative_order": "ahead|behind",
+
+        "overlap": false
+      }
+    }
+  },
+
+  "interaction_topology": {
+
+    "shared_lanes": [
+      "lane_id"
+    ],
+
+    "shared_lane_ratio": 0.0,
+
+    "shared_junctions": [
+      "junction_id"
+    ],
+
+    "common_merge_points": [
+      "lane_id"
+    ],
+
+    "common_diverge_points": [
+      "lane_id"
+    ],
+
+    "common_successors": [
+      "lane_id"
+    ],
+
+    "common_predecessors": [
+      "lane_id"
+    ],
+
+    "shared_future_junctions": [
+      "junction_id"
+    ],
+
+    "shared_route_segments": [
+      [
+        "lane_id",
+        "lane_id"
+      ]
+    ]
+  },
+
+  "meta": {
+
+    "lane_id": {
+
+      "type": "lane|connecting_lane",
+
+      "road_id": "string",
+
+      "junction_id": "string",
+
+      "successors": [],
+
+      "predecessors": [],
+
+      "adjacent": []
+    }
   }
 }
 ```
 
-## Vehicle Timeline Frame
-
-```python
-{
-    "region_id": int,
-    "world": {
-        "x": float,
-        "y": float
-    },
-    "sd": {
-        "s": float,
-        "d": float
-    }
-}
-```
-
-## Pair Timeline Frame
-
-```python
-{
-    "distance": float,
-    "delta_s": float,
-    "delta_d": float
-}
-```
-
-The context schema is treated as the system contract.
-
 ---
 
-# Coordinate Systems
+# Semantic Rules
 
-TRACE uses three coordinate spaces.
+## Actors
 
-## Pixel Space
+Actors represent traffic participants within the selected coexistence window.
 
-Used for:
-
-- Rendering
-- Annotation
-- Mask lookup
-
-## World Space
-
-Obtained through homography.
+Current implementation uses two actors:
 
 ```text
-Pixel -> World
+A
+B
 ```
 
-## Frenet Space
+This keeps the contract independent from specific IDs such as:
 
 ```text
-s = longitudinal position
-
-d = lateral offset
+V1
+V2
 ```
-
-Computed against lane centerlines.
 
 ---
 
-# RoadInfrastructure Layer
+## Route Semantics
 
-RoadInfrastructure is the geometric foundation.
+Route semantics describe progression through the topology graph.
 
-## Region Types
-
-Supported:
-
-- lane
-- connecting_lane
-- overlap
-
-## Topology Knowledge
-
-Stores:
-
-- successors
-- predecessors
-- adjacency
-- merge relationships
-- shared junctions
-
-## Geometry Services
-
-Provides:
-
-### Projection
+Valid transition types:
 
 ```text
-Pixel -> World
-World -> Pixel
-World -> Frenet
+FOLLOW
+LANE_CHANGE
+DIVERGE
+TRANSFER
 ```
 
-### Centerlines
+These are infrastructure facts.
 
-- compute centerlines
-- cache centerlines
-- project to centerlines
-
-### Lane Relationships
-
-Detects:
-
-- same lane
-- adjacent lane
-- merge relationship
-- successor relationship
-- shared junction
+They are not events.
 
 ---
 
-# Signal Engine
+## Topology Facts
 
-Purpose:
-
-Convert raw trajectories into motion signals.
-
-## ContextBuilder
-
-Generates:
-
-### Vehicle Context
-
-Contains:
-
-- world position
-- region id
-- frenet coordinates
-- global s coordinate
-
-### Pairwise Context
-
-Contains:
-
-- distance
-- TTC
-- lane relation
-- interaction relevance
-
----
-
-## Kinematics
-
-Computes:
-
-- vx
-- vy
-- speed
-- frenet velocity
-
----
-
-## SignalComputer
-
-Computes:
-
-- lane relations
-- TTC
-- distance metrics
-- interaction significance
-
----
-
-# Scenario Engine
-
-Purpose:
-
-Transform context into semantic information.
-
-## Major Stages
-
-```text
-Context
-   ↓
-Signal Enrichment
-   ↓
-Topology Enrichment
-   ↓
-Behavior Features
-   ↓
-Event Detection
-   ↓
-Rule Generation
-```
-
----
-
-# Path Semantics
-
-The engine classifies route relationships.
-
-Possible outputs:
-
-```text
-same_lane
-shared_path
-adjacent_flow
-shared_junction
-merge
-crossing
-independent
-unknown
-```
-
-These labels become major inputs for event and rule reasoning.
-
----
-
-# Event Detection
-
-TRACE is event-first.
-
-Rules are derived from events.
-
-## Event Types
-
-### Lane Change
-
-Generated using:
-
-- lane transitions
-- topology analysis
-
-### Proximity
-
-Generated using:
-
-- distance thresholds
-- convergence signals
-- hysteresis logic
-
-### Waiting
-
-Generated using:
-
-- low speed
-- sustained duration
-
----
-
-# Event Timeline
-
-Canonical event format:
-
-```python
-{
-    "type": "proximity",
-    "t_start": float,
-    "t_end": float,
-    "participants": [...],
-    "metrics": {...},
-    "features": {...}
-}
-```
-
----
-
-# Temporal Graph System
-
-Events are converted into a graph.
-
-## Edge Types
-
-### before
-
-```text
-A -> B
-```
-
-### overlaps
-
-```text
-A overlaps B
-```
-
-### supports
-
-```text
-Event supports Rule
-```
-
-Used for higher-order behavior extraction.
-
----
-
-# GoRules Rule Engine
-
-TRACE uses an external DSL.
-
-Rule definitions live outside Python.
-
-Advantage:
-
-- analysts can modify behavior logic
-- code changes are minimized
-
-## Inputs
+Topology facts describe graph properties.
 
 Examples:
 
 ```text
-path relationship
-minimum distance
-TTC
-lane changes
-waiting duration
-convergence
-sign flips
+junctions visited
+merge points visited
+diverge points visited
 ```
 
-## Rule Categories
-
-### Lane Behavior
-
-- lane_change
-- aggressive_lane_change
-- smooth_lane_change
-- cut_in
-
-### Interaction Behavior
-
-- merge
-- yield
-- overtake
-- avoidance
-
-### Safety Behavior
-
-- near_miss
-- dangerous_following
-- critical_proximity
-
-### Waiting Behavior
-
-- waiting_for_gap
-- waiting_for_merge_gap
-- gap_acceptance
-
-### Route Behavior
-
-- connector_navigation
-- complex_route_navigation
-- multi_stage_lane_positioning
+They are independent from traffic behavior.
 
 ---
 
-# Behavioral Features
+## Interaction Topology
 
-The scenario engine extracts:
+Interaction topology describes route relationships between actors.
 
-## Longitudinal Features
+Examples:
 
-- closing rate
-- TTC
-- distance trend
+```text
+shared route
+shared junction
+common merge
+common diverge
+shared future conflict zone
+```
 
-## Lateral Features
+These are facts available to GoRules.
 
-- lateral crossings
-- lateral rates
-
-## Interaction Features
-
-- convergence
-- sign flips
-- ordering changes
+They are not conclusions.
 
 ---
 
-# Scenario Descriptor
+## Meta
 
-One of TRACE's most important outputs.
+Meta contains immutable infrastructure topology.
 
-Purpose:
+This information originates from:
 
-- retrieval
-- similarity search
-- indexing
-- explainability
+```text
+OpenDRIVE
+Lanelet enrichment
+Layout metadata
+```
 
-## Components
+and is the authoritative graph representation used throughout TRACE.
 
-### Event Graph
+---
+
+# Explicit Non-Goals
+
+The following fields shall never appear inside MapScenarioContext:
+
+```text
+proximity
+waiting
+yield
+gap_acceptance
+dangerous_following
+near_miss
+connector_navigation
+complex_route_navigation
+```
+
+These belong to EngineContext because they are produced by GoRules.
+
+---
+
+# Evolution Rules
+
+Future versions of MapScenarioContext may add:
+
+```text
+new topology facts
+new route semantics
+new interaction facts
+```
+
+but must not add:
+
+```text
+behavior classifications
+rule outputs
+semantic interpretations
+```
+
+The contract must remain purely factual.
+```
+---
+
+# Scope
+
+Defines scenario boundaries.
+
+Example:
+
+```python
+{
+    "actor_a": "V1",
+    "actor_b": "V2",
+
+    "start_frame": 150,
+    "end_frame": 420
+}
+```
+
+---
+
+# Actors
+
+Contains map-derived facts for individual actors.
+
+Example:
+
+```python
+actors = {
+
+    "A": {
+
+        "timeline": ...,
+
+        "route_semantics": ...,
+
+        "topology_facts": ...
+    },
+
+    "B": {
+        ...
+    }
+}
+```
+
+No events.
+
+No behaviors.
+
+No rule conclusions.
+
+---
+
+# Interaction
+
+Contains pairwise facts.
+
+Example:
+
+```python
+distance
+delta_s
+delta_d
+ttc
+relative order
+```
+
+Plus shared topology facts.
+
+No events.
+
+No traffic interpretations.
+
+---
+
+# Route Semantics
+
+Represents route progression through topology.
+
+Example:
+
+```python
+{
+    "route": [
+        "17",
+        "21",
+        "22"
+    ],
+
+    "transitions": [
+        "FOLLOW",
+        "FOLLOW",
+        "DIVERGE"
+    ]
+}
+```
+
+Route semantics are infrastructure facts.
+
+They are not events.
+
+They are not behaviors.
+
+---
+
+# Topology Facts
+
+Produced directly from topology.
+
+Examples:
+
+```python
+junctions
+merge_points
+diverge_points
+```
+
+Interaction examples:
+
+```python
+shared_lanes
+shared_lane_ratio
+shared_junctions
+common_merge_points
+common_diverge_points
+```
+
+All topology facts must remain generic.
+
+No roundabout-specific concepts.
+
+No intersection-specific concepts.
+
+---
+
+# Route Semantics Are Not Events
+
+Correct:
+
+```text
+FOLLOW
+DIVERGE
+TRANSFER
+```
+
+Incorrect:
+
+```text
+yield
+merge_behavior
+roundabout_entry
+```
+
+Behavioral interpretations belong to GoRules.
+
+---
+
+# EngineContext
+
+Produced by Scenario Engine.
+
+Consumes:
+
+```text
+MapScenarioContext
+```
+
+Produces:
+
+```python
+{
+    "kind": "engine_context",
+
+    "events": [...],
+
+    "behaviors": [...],
+
+    "insights": [...],
+
+    "descriptor": {...}
+}
+```
+
+---
+
+# Events
+
+Generated by GoRules.
+
+Examples:
+
+```text
+proximity
+waiting
+lane_change
+```
+
+Events are observable traffic situations.
+
+---
+
+# Behaviors
+
+Generated by GoRules.
+
+Examples:
+
+```text
+yield
+gap_acceptance
+dangerous_following
+connector_navigation
+near_miss
+```
+
+Behaviors are interpretations.
+
+Events and behaviors must remain separate.
+
+---
+
+# Descriptor
+
+The descriptor is the canonical searchable representation.
+
+Built after GoRules execution.
 
 Contains:
 
-- event nodes
-- rule nodes
-- temporal links
+```text
+topology fingerprints
+route fingerprints
+event fingerprints
+behavior fingerprints
+signal summaries
+```
 
-### Search Index
-
-Contains:
-
-- event types
-- rule types
-- transitions
-- motifs
-
-### Numerical Fingerprint
-
-Contains:
-
-- speed statistics
-- distance statistics
-- TTC
-- lane-change counts
-- event counts
-
-### Topology Fingerprint
-
-Contains:
-
-- path relationship
-- merge characteristics
-- crossing characteristics
-- junction participation
+Descriptor is the primary search artifact.
 
 ---
 
 # Similarity Search
 
-Similarity scoring combines:
+(Not currently the active focus.)
 
-## Event Similarity
+Similarity search operates on scenario descriptors generated after GoRules reasoning.
 
-Sequence-based comparison.
+The searchable unit remains:
 
-## Rule Similarity
+```text
+actor pair
++
+coexistence window
+```
 
-Behavior overlap.
-
-## Semantic Similarity
-
-Interaction pattern matching.
-
-## Infrastructure Similarity
-
-Road usage similarity.
-
-Scenarios are compared using signatures generated from descriptors and event sequences.
+not entire datasets.
 
 ---
 
 # Explanation Engine
 
-Purpose:
-
-Translate machine reasoning into human-readable descriptions.
-
-Outputs:
-
-- scenario summary
-- event summary
-- timeline explanation
-- maneuver explanation
-- risk observations
-
-Example:
+Consumes:
 
 ```text
-Vehicle 1 changes lane.
-Vehicles enter close proximity.
-Near-miss likelihood is high.
+MapScenarioContext
+Events
+Behaviors
+Descriptor
 ```
+
+Produces:
+
+```text
+Scenario summaries
+Behavior explanations
+Risk observations
+Traffic descriptions
+```
+
+No new semantics should be invented here.
 
 ---
 
-# LSTM Behavioral Modeling
+# OpenLABEL Alignment
 
-Optional ML subsystem.
-
-Model:
+Semantic database targets OpenLABEL concepts:
 
 ```text
-LSTM-VAE
+Objects
+Relations
+Contexts
+Actions
+Attributes
 ```
 
-Architecture:
+Topology and route semantics are exported as context.
 
-- path embedding
-- trajectory encoder
-- latent space
-- decoder
-
-## Produced Signature
-
-```python
-{
-  z_mu,
-  z_std,
-  z_norm,
-  aggressiveness
-}
-```
-
-Potential uses:
-
-- clustering
-- anomaly detection
-- retrieval
-- future hybrid reasoning
+Events and behaviors are stored separately.
 
 ---
 
-# OpenSCENARIO Export
+# OpenSCENARIO Alignment
 
-Purpose:
-
-Convert inferred scenarios into executable simulations.
-
-Generated artifacts:
-
-### Road Network
-
-OpenDRIVE reference.
-
-### Entities
-
-- vehicle1
-- vehicle2
-
-### Spawn Logic
-
-Primary:
+OpenSCENARIO export consumes:
 
 ```text
-LanePosition
+MapScenarioContext
+Events
+Behaviors
+Routes
 ```
 
-Fallback:
+and generates:
 
 ```text
-WorldPosition
-```
-
-### Maneuvers
-
-- speed actions
-- lane keeping
-- lane changes
-- stops
-
-### Storyboard
-
-```text
-Init
-Act
+Entities
+Routes
+Actions
 Triggers
-Maneuver Groups
-Stop Trigger
+Storyboards
 ```
 
----
-
-# Design Principles
-
-## 1. Context-Driven Architecture
-
-Every subsystem consumes the same context model.
-
-## 2. Topology First
-
-Map semantics dominate behavioral reasoning.
-
-## 3. Event First
-
-Rules are built from events.
-
-## 4. Explainability First
-
-Every rule should be explainable.
-
-## 5. Simulation Ready
-
-Outputs are designed for OpenSCENARIO export.
-
-## 6. Extensible DSL
-
-Behavior logic lives in external rule definitions.
-
-## 7. Hybrid AI
-
-Supports both:
-
-- symbolic reasoning (GoRules)
-- learned embeddings (LSTM-VAE)
+The exporter translates semantic reasoning but does not define it.
 
 ---
-## License
 
-TRACE is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
+# Rules For Future Development
 
-## Acknowledgement
-<br><div align="center">
-  <img src="docs/synergies.svg" alt="Synergies logo" width="200"/>
-</div>
+Rule 1
 
-This package is developed as part of the [SYNERGIES](https://synergies-ccam.eu/) project.
+Infrastructure facts belong to RoadInfrastructure and LaneMapViewer.
 
-<br><div align="center">
-  <img src="docs/funded_by_eu.svg" alt="Funded by EU" width="200"/>
-</div>
+Rule 2
 
-Funded by the European Union. Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or European Climate, Infrastructure and Environment Executive Agency (CINEA). Neither the European Union nor the granting authority can be held responsible for them.
+MapScenarioContext contains facts only.
+
+Rule 3
+
+Scenario Engine prepares rule inputs.
+
+Rule 4
+
+GoRules owns events and behaviors.
+
+Rule 5
+
+Context must not contain rule conclusions.
+
+Rule 6
+
+Route semantics are not events.
+
+Rule 7
+
+Topology facts are not behaviors.
+
+Rule 8
+
+Always add infrastructure facts before adding new traffic rules.
+
+Rule 9
+
+Avoid map-specific semantics.
+
+Rule 10
+
+If a concept can be represented as a fact, place it in MapScenarioContext before considering a GoRules implementation.

@@ -1,6 +1,7 @@
 # scenario_rule_gui.py
 import math
 import numpy as np
+import copy
 import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit, QTextEdit,
@@ -144,62 +145,99 @@ class ScenarioRuleGUI(QWidget):
             self.v2_world_polyline = poly
 
     def _convert_to_rule_engine_context(self, ctx):
-        duration = self.duration_seconds or ctx.get("duration_seconds")
-        if not isinstance(duration, (int, float)) or duration <= 0:
-            raise RuntimeError("Invalid duration")
-        dt = ctx.get("meta", {}).get("dt", 1.0)
-        for vid in ("V1", "V2"):
-            Kinematics.compute_velocity_from_timeline(
-                ctx["vehicles"][vid]["timeline"],
-                dt
+
+        duration = (
+            self.duration_seconds
+            or ctx.get("duration_seconds")
+        )
+
+        if (
+            not isinstance(
+                duration,
+                (int, float)
             )
-        base_ctx = {
-            "ready": True,  
-            "vehicles": ctx["vehicles"],
-            "pair": ctx["pair"],
-            "duration_seconds": float(duration),
-            "meta": ctx.get("meta", {}),
-            "context_version": ctx.get("context_version")
-        }
-        try:
-            enriched = build_engine_insight_context(
+            or duration <= 0
+        ):
+            raise RuntimeError(
+                "Invalid duration"
+            )
+
+        base_ctx = copy.deepcopy(ctx)
+
+        base_ctx["ready"] = True
+        base_ctx["duration_seconds"] = float(duration)
+
+        actors = base_ctx.get(
+            "actors",
+            {}
+        )
+        enriched = (
+            build_engine_insight_context(
                 context=base_ctx,
-                duration=base_ctx["duration_seconds"]
+                duration=float(duration)
             )
-        except Exception as e:
-            raise RuntimeError(f"engine build failed: {e}")
+        )
 
-        try:
-            enriched = enrich_with_topology(enriched)
-        except Exception:
-            enriched["topology_error"] = True
+        enriched["kind"] = (
+            "engine_context"
+        )
 
-        try:
-            enriched = enrich_with_signal_metrics(enriched)
-        except Exception:
-            enriched["signals_error"] = True
-
-        try:
-            enriched["events"] = detect_events(enriched)
-            enriched["event_timeline"] = _build_event_timeline(enriched)
-        except Exception:
-            enriched["events_error"] = True
-
-        if "derived" not in enriched:
-            raise RuntimeError("Engine enrichment missing 'derived'")
+        enriched["version"] = "1.0"
 
         return enriched
         
     def ingest_map_context(self, ctx: dict):
+        if ctx.get("kind") != "map_scenario_context":
+            return        
         if not ctx or ctx.get("ready") is not True:
             return
         validate_context(ctx)
-        if not ctx["vehicles"]["V1"]["timeline"] or not ctx["vehicles"]["V2"]["timeline"]:
-            QMessageBox.warning(self, "Context Error", "Empty timelines")
+        actors = ctx.get(
+            "actors",
+            {}
+        )
+
+        if not (
+            actors.get(
+                "A",
+                {}
+            ).get(
+                "timeline",
+                {}
+            )
+        ):
+            QMessageBox.warning(
+                self,
+                "Context Error",
+                "Actor A timeline empty"
+            )
             return
 
-        if "pair" not in ctx or "timeline" not in ctx["pair"]:
-            QMessageBox.warning(self, "Context Error", "Missing pair timeline")
+        if not (
+            actors.get(
+                "B",
+                {}
+            ).get(
+                "timeline",
+                {}
+            )
+        ):
+            QMessageBox.warning(
+                self,
+                "Context Error",
+                "Actor B timeline empty"
+            )
+            return
+
+        if (
+            "interaction_facts"
+            not in ctx
+        ):
+            QMessageBox.warning(
+                self,
+                "Context Error",
+                "Missing interaction facts"
+            )
             return
         self._map_context = ctx
         ctx_duration = ctx.get("duration_seconds")
@@ -213,8 +251,9 @@ class ScenarioRuleGUI(QWidget):
             return
 
         self._last_context = self._engine_context
-        self.engine_context_ready.emit(self._engine_context)
-        self._populate_insights_table(self._engine_context)
+        self._populate_insights_table(
+            self._engine_context
+        )
 
     @staticmethod
     def _read_centerline(meta: dict, rid: int):
@@ -338,6 +377,24 @@ class ScenarioRuleGUI(QWidget):
             new_pts.append((float(p[0]), float(p[1])))
         return new_pts    
 
+    def _actors_to_vehicle_view(self, ctx):
+
+        actors = ctx.get("actors", {})
+
+        return {
+
+            "V1":
+                actors.get(
+                    "A",
+                    {}
+                ),
+
+            "V2":
+                actors.get(
+                    "B",
+                    {}
+                )
+        }
 
     def generate_rules(self):
         if not self._map_context:
@@ -347,7 +404,7 @@ class ScenarioRuleGUI(QWidget):
         if not ctx:
             QMessageBox.warning(self, "Missing Context", "Engine context not initialized.")
             return
-        if "vehicles" not in ctx or "derived" not in ctx:
+        if "actors" not in ctx or "derived" not in ctx:
             QMessageBox.critical(self, "Context Error", "Engine context corrupted.")
             return
         final_ctx = ctx   
@@ -725,7 +782,7 @@ class ScenarioRuleGUI(QWidget):
         key = "v1_path_regions" if vlabel == "v1" else "v2_path_regions"
         path_regions = (ctx or {}).get(key, [])
         if not path_regions:
-            veh = ctx["vehicles"]["V1"] if vlabel == "v1" else ctx["vehicles"]["V2"]
+            veh = self._actors_to_vehicle_view(ctx)["V1"] if vlabel == "v1" else self._actors_to_vehicle_view(ctx)["V2"]
             path_regions = [
                 f.get("region_id")
                 for f in veh.get("timeline", {}).values()
@@ -838,24 +895,83 @@ class ScenarioRuleGUI(QWidget):
         # 1. CORE SIGNALS 
         # ==================================================
         base_metrics = {
-            "min_distance": signals.get("min_distance"),
-            "max_distance": signals.get("max_distance"),
-            "avg_closing_rate": signals.get("avg_closing_rate"),
-            "path_relationship": ctx.get("path_relationship"),
+
+            "min_distance":
+                signals.get(
+                    "min_distance"
+                ),
+
+            "max_distance":
+                signals.get(
+                    "max_distance"
+                ),
+
+            "avg_closing_rate":
+                signals.get(
+                    "avg_closing_rate"
+                )
         }
 
         for k, v in base_metrics.items():
             add(k, v)
 
+        interaction_topology = (
+            ctx.get(
+                "interaction_topology",
+                {}
+            )
+        )
+
+        add(
+            "shared_lane_fraction",
+            interaction_topology.get(
+                "shared_lane_ratio"
+            )
+        )
+
+        add(
+            "shared_junction_count",
+            len(
+                interaction_topology.get(
+                    "shared_junctions",
+                    []
+                )
+            )
+        )
+
+        add(
+            "common_merge_count",
+            len(
+                interaction_topology.get(
+                    "common_merge_points",
+                    []
+                )
+            )
+        )
+
+        add(
+            "common_diverge_count",
+            len(
+                interaction_topology.get(
+                    "common_diverge_points",
+                    []
+                )
+            )
+        )
         # ==================================================
         # 2. PROBABILISTIC SIGNALS 
         # ==================================================
         for k in (
-            "prob_near_miss",
-            "prob_avoidance",
-            "prob_overtake",
-            "prob_lateral",
-            "prob_proximity"
+            "shared_junction",
+            "shared_lane_fraction",
+            "common_merge_count",
+            "common_diverge_count",
+            "min_ttc",
+            "distance_min",
+            "interaction_convergence",
+            "interaction_lateral_cross",
+            "interaction_sign_flip",
+            "waiting_duration_s"
         ):
             if k in ctx:
                 add(k, ctx.get(k))
@@ -863,10 +979,42 @@ class ScenarioRuleGUI(QWidget):
         # ==================================================
         # 3. INTERACTION FEATURES  
         # ==================================================
-        interaction = ctx.get("interaction", {})
+        interaction = (
+            ctx.get(
+                "derived",
+                {}
+            ).get(
+                "interaction_features",
+                {}
+            )
+        )
         for k, v in interaction.items():
             add(k, v)
-
+        rule_inputs = (
+            ctx.get(
+                "derived",
+                {}
+            ).get(
+                "rule_inputs",
+                {}
+            )
+        )
+        for k in (
+            "shared_lane_fraction",
+            "shared_junction",
+            "common_merge_count",
+            "common_diverge_count",
+            "interaction_convergence",
+            "interaction_lateral_cross",
+            "interaction_sign_flip",
+            "waiting_duration_s",
+            "distance_min"
+        ):
+            if k in rule_inputs:
+                add(
+                    f"rule_{k}",
+                    rule_inputs[k]
+                )
         # ==================================================
         # 4. TIMELINE EVENT STATS  
         # ==================================================
@@ -899,7 +1047,54 @@ class ScenarioRuleGUI(QWidget):
         # ==================================================
         # 6. SCENARIO DESCRIPTOR
         # ==================================================
+        actors = (
+            ctx.get(
+                "actors",
+                {}
+            )
+        )
 
+        for actor in ("A", "B"):
+
+            route = (
+                actors.get(
+                    actor,
+                    {}
+                )
+                .get(
+                    "route_semantics",
+                    {}
+                )
+                .get(
+                    "route",
+                    []
+                )
+            )
+
+            transitions = (
+                actors.get(
+                    actor,
+                    {}
+                )
+                .get(
+                    "route_semantics",
+                    {}
+                )
+                .get(
+                    "transitions",
+                    []
+                )
+            )
+
+            add(
+                f"{actor}_route_regions",
+                len(route)
+            )
+
+            add(
+                f"{actor}_route_transitions",
+                len(transitions)
+            )
         descriptor = (
             derived.get("scenario_descriptor")
             or {}
@@ -1097,8 +1292,8 @@ class ScenarioRuleGUI(QWidget):
             QMessageBox.warning(self, "Context Error", "Generate rules first.")
             return
         ctx = self._engine_context
-        v1 = ctx["vehicles"]["V1"]
-        v2 = ctx["vehicles"]["V2"]
+        v1 = self._actors_to_vehicle_view(ctx)["V1"]
+        v2 = self._actors_to_vehicle_view(ctx)["V2"]
         if not v1 or not v2:
             QMessageBox.warning(self, "Export Error", "Vehicles missing.")
             return

@@ -8,6 +8,7 @@ import time
 from typing import List, Tuple
 import cv2
 import numpy as np
+import copy
 from scipy.spatial import cKDTree
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF
 from PyQt6.QtGui import (
@@ -433,8 +434,8 @@ class LaneMapViewer(QWidget):
             "manual": {"V1": [], "V2": []},
             "json": {"V1": [], "V2": []},
         }
-        self._context_manual = {"ready": False}
-        self._context_json = {"ready": False}
+        self._map_context_manual = {"ready": False}
+        self._map_context_json = {"ready": False}
         self.openlabel_frames = None
         self.openlabel_traj_map = None
         self.openlabel_fmin = 0
@@ -1206,20 +1207,35 @@ class LaneMapViewer(QWidget):
     
     # ===================== NEW MAIN LAYOUT =====================
 
-    def _get_hover_vehicle_insight(self, vid, idx):
-        ctx = self._context_manual if self.is_manual_mode else self._context_json
+    def _get_hover_vehicle_insight(
+            self,
+            vid,
+            idx):
 
-        if not ctx.get("ready"):
-            return None
+        ctx = (
+            self._map_context_manual
+            if self.is_manual_mode
+            else self._map_context_json
+        )
 
-        veh = ctx.get("vehicles", {}).get(vid, {})
-        timeline = veh.get("timeline", {})
+        actor = (
+            "A"
+            if vid == "V1"
+            else "B"
+        )
+
+        timeline = (
+            ctx.get("actors", {})
+            .get(actor, {})
+            .get("timeline", {})
+        )
 
         frame = timeline.get(idx)
+
         if not frame:
             return None
 
-        sd = frame.get("sd") or {}
+        sd = frame.get("sd", {})
 
         return {
             "s": sd.get("s"),
@@ -1229,11 +1245,18 @@ class LaneMapViewer(QWidget):
         }
 
     def _get_hover_pair_insight(self, idx):
-        ctx = self._context_manual if self.is_manual_mode else self._context_json
+        ctx = self._map_context_manual if self.is_manual_mode else self._map_context_json
 
-        pair = ctx.get("pair", {})
-        timeline = pair.get("timeline", {})
-
+        timeline = (
+            ctx.get(
+                "interaction_facts",
+                {}
+            )
+            .get(
+                "timeline",
+                {}
+            )
+        )
         p = timeline.get(idx)
         if not p:
             return None
@@ -1574,22 +1597,37 @@ class LaneMapViewer(QWidget):
             traj1 = self._traj_to_builder_format(v1_traj)
             traj2 = self._traj_to_builder_format(v2_traj)
 
-            ctx1 = self._ctx_builder.build_vehicle_context(traj1)
-            ctx2 = self._ctx_builder.build_vehicle_context(traj2)
+            ctx_a = self._ctx_builder.build_vehicle_context(traj1)
+            ctx_b = self._ctx_builder.build_vehicle_context(traj2)
 
         except Exception as e:
             return None, f"vehicle_ctx_failed: {e}"
 
-        return (ctx1, ctx2), None
+        return (ctx_a, ctx_b), None
 
     def _empty_context(self):
+
         return {
-            "ready": False,
-            "state": "init",
-            "error": None,
-            "vehicles": {},
-            "pair": {},
-            "meta": {},
+
+            "kind":
+                "map_scenario_context",
+
+            "ready":
+                False,
+
+            "state":
+                "init",
+
+            "error":
+                None,
+
+            "actors": {},
+
+            "interaction_facts": {},
+
+            "interaction_topology": {},
+
+            "meta": {}
         }
 
     def _invalidate_active_scenario(self, reason=""):
@@ -1758,7 +1796,7 @@ class LaneMapViewer(QWidget):
         return {
             "traj_map": self._traj_map_manual if self.is_manual_mode else self._traj_map_json,
             "world": self._world_polylines_manual if self.is_manual_mode else self._world_polylines_json,
-            "context": self._context_manual if self.is_manual_mode else self._context_json,
+            "context": self._map_context_manual if self.is_manual_mode else self._map_context_json,
             "items": self._traj_items.setdefault(self.active_mode, {"V1": [], "V2": []})
         }
 
@@ -1773,33 +1811,35 @@ class LaneMapViewer(QWidget):
         return 0.1
 
     def _build_normalize_validate_emit(self):
+
         ctx = self.build_context_atomic()
 
-        if not ctx.get("vehicles") or "V1" not in ctx["vehicles"]:
-            ctx["ready"] = False
-            return ctx
         try:
+
             ctx = normalize_context(ctx)
-            ctx["vehicles"]["V1"]["timeline"] = _fix_timeline_keys(
-                ctx["vehicles"]["V1"]["timeline"]
-            )
-            ctx["vehicles"]["V2"]["timeline"] = _fix_timeline_keys(
-                ctx["vehicles"]["V2"]["timeline"]
-            )
-            ctx["pair"]["timeline"] = _fix_timeline_keys(
-                ctx["pair"]["timeline"]
-            )
+
             validate_context(ctx)
+
             ctx["ready"] = True
 
         except Exception as e:
+
+            import traceback
+            traceback.print_exc()
+
+            print(
+                "[CONTEXT VALIDATION FAILED]",
+                type(e).__name__,
+                str(e)
+            )
+
             ctx["ready"] = False
             ctx["error"] = str(e)
 
         if self.is_manual_mode:
-            self._context_manual = ctx
+            self._map_context_manual = ctx
         else:
-            self._context_json = ctx
+            self._map_context_json = ctx
 
         return ctx
 
@@ -1814,23 +1854,23 @@ class LaneMapViewer(QWidget):
         if err:
             return self._fail_ctx(ctx, err)
 
-        ctx1, ctx2 = vehicles_ctx
+        ctx_a, ctx_b = vehicles_ctx
 
         try:
-            k1 = set(map(int, ctx1["timeline"].keys()))
-            k2 = set(map(int, ctx2["timeline"].keys()))
+            k1 = set(map(int, ctx_a["timeline"].keys()))
+            k2 = set(map(int, ctx_b["timeline"].keys()))
             common = sorted(k1 & k2)
 
             if not common:
                 return self._fail_ctx(ctx, "no_common_frames")
 
-            ctx1["timeline"] = {k: ctx1["timeline"].get(k) for k in common}
-            ctx2["timeline"] = {k: ctx2["timeline"].get(k) for k in common}
+            ctx_a["timeline"] = {k: ctx_a["timeline"].get(k) for k in common}
+            ctx_b["timeline"] = {k: ctx_b["timeline"].get(k) for k in common}
 
-            _dbg("aligned V1 size", len(ctx1["timeline"]))
-            _dbg("aligned V2 size", len(ctx2["timeline"]))
+            _dbg("aligned V1 size", len(ctx_a["timeline"]))
+            _dbg("aligned V2 size", len(ctx_b["timeline"]))
 
-            pair = self._ctx_builder.build_pairwise(ctx1, ctx2)
+            pair = self._ctx_builder.build_pairwise(ctx_a, ctx_b)
 
             _dbg("pair timeline size BEFORE fill", len(pair.get("timeline", {})))
 
@@ -1849,44 +1889,17 @@ class LaneMapViewer(QWidget):
 
         if not pair or not pair.get("timeline"):
             return self._fail_ctx(ctx, "empty_pairwise")
-        v1_topology = (
-            self._topology_transition_sequence(
-                ctx1.get(
-                    "timeline",
-                    {}
-                )
-            )
+        
+        return self._build_pair_scenario_context(
+            actor_a_id="A",
+            actor_b_id="B",
+            ctx_a=ctx_a,
+            ctx_b=ctx_b,
+            pair=pair,
+            start_frame=common[0],
+            end_frame=common[-1]
         )
-
-        v2_topology = (
-            self._topology_transition_sequence(
-                ctx2.get(
-                    "timeline",
-                    {}
-                )
-            )
-        )
-        ctx.update({
-            "ready": False,
-            "state": "pair_ready",
-
-            "vehicles": {
-                "V1": {"timeline": ctx1.get("timeline", {})},
-                "V2": {"timeline": ctx2.get("timeline", {})}
-            },
-
-            "pair": pair,
-            "duration_seconds": float(self._get_valid_duration() or 1.0),
-            "context_version": "timeline_v2",
-            "topology": {
-                "V1": v1_topology,
-                "V2": v2_topology
-            },
-            "meta": getattr(self.road, "meta", {}) or {},
-        })
-
-        return ctx
-
+    
     def build_semantic_context(self, ctx):
         """
         Enrich a map-based context with scenario-engine events and produce a
@@ -1903,11 +1916,52 @@ class LaneMapViewer(QWidget):
         - Fall back to features, interaction, and metrics.
         - Preserve from/to region for transition events.
         """
-
+        ctx = copy.deepcopy(ctx)
         if not isinstance(ctx, dict) or not ctx:
             return {}
 
         ctx["ready"] = True
+        if "vehicles" not in ctx:
+
+            actors = ctx.get("actors", {})
+
+            ctx["vehicles"] = {
+
+                "V1": {
+                    "timeline":
+                        actors.get(
+                            "A",
+                            {}
+                        ).get(
+                            "timeline",
+                            {}
+                        )
+                },
+
+                "V2": {
+                    "timeline":
+                        actors.get(
+                            "B",
+                            {}
+                        ).get(
+                            "timeline",
+                            {}
+                        )
+                }
+            }
+
+        if "pair" not in ctx:
+
+            ctx["pair"] = {
+                "timeline":
+                    ctx.get(
+                        "interaction_facts",
+                        {}
+                    ).get(
+                        "timeline",
+                        {}
+                    )
+            }
 
         def _finite_float(value, default=None):
             try:
@@ -2252,16 +2306,27 @@ class LaneMapViewer(QWidget):
 
         return ctx
 
-    def _fail_ctx(self, ctx, err):
+    def _fail_ctx(
+            self,
+            ctx,
+            err):
+
         ctx.update({
-            "ready": False,
-            "state": "failed",
-            "error": err,
-            "vehicles": {
-                "V1": {"timeline": {}},
-                "V2": {"timeline": {}},
-            },
-            "pair": {"timeline": {}},
+
+            "ready":
+                False,
+
+            "state":
+                "failed",
+
+            "error":
+                err,
+
+            "actors": {},
+
+            "interaction_facts": {},
+
+            "interaction_topology": {}
         })
 
         return ctx
@@ -2282,9 +2347,45 @@ class LaneMapViewer(QWidget):
             self.apply_manual_trajectory()
         else:
             self.apply_loaded_trajectories()
-        print("CTX READY:", self._context_json.get("ready"))
-        print("V1 timeline size:", len(self._context_json.get("vehicles", {}).get("V1", {}).get("timeline", {})))
-        print("Pair timeline size:", len(self._context_json.get("pair", {}).get("timeline", {})))            
+        print(
+            "CTX READY:",
+            self._map_context_json.get("ready")
+        )
+
+        print(
+            "A timeline size:",
+            len(
+                self._map_context_json
+                .get("actors", {})
+                .get("A", {})
+                .get("timeline", {})
+            )
+        )
+
+        print(
+            "B timeline size:",
+            len(
+                self._map_context_json
+                .get("actors", {})
+                .get("B", {})
+                .get("timeline", {})
+            )
+        )
+
+        print(
+            "Interaction timeline size:",
+            len(
+                self._map_context_json
+                .get(
+                    "interaction_facts",
+                    {}
+                )
+                .get(
+                    "timeline",
+                    {}
+                )
+            )
+        )   
 
     def update_hover_coords(self, px: int, py: int):
         self._hover_px = (px, py)
@@ -2447,7 +2548,7 @@ class LaneMapViewer(QWidget):
 
 
     def _emit_active_context(self):
-        ctx = self._context_manual if self.is_manual_mode else self._context_json
+        ctx = self._map_context_manual if self.is_manual_mode else self._map_context_json
 
         if not ctx:
             return
@@ -2466,11 +2567,13 @@ class LaneMapViewer(QWidget):
             print("[LaneMapViewer] Ignored invalid engine context")
             return
 
-        if "vehicles" not in ctx or "derived" not in ctx:
-            print("[LaneMapViewer] Incomplete engine context")
+        if ctx.get("kind") != "engine_context":
+            print(
+                "[LaneMapViewer] "
+                "Ignored non-engine context"
+            )
             return
         self._engine_context = dict(ctx)
-        self._last_engine_context = dict(ctx)
         print("[LaneMapViewer]  Engine context received")
         try:
             self._debug_save_context(ctx, tag="engine_enriched")
@@ -3115,7 +3218,7 @@ class LaneMapViewer(QWidget):
         except:
             return self.log_warn("Invalid frame selection.")
 
-        self._context_json = self._empty_context()
+        self._map_context_json = self._empty_context()
         self._engine_context = None
 
         if fstart > fend:
@@ -3419,37 +3522,68 @@ class LaneMapViewer(QWidget):
                     )
                 )
 
-                topo_score_v1 = (
-                    self._sequence_similarity(
-                        q_track.get(
-                            "topology_v1",
-                            []
-                        ),
-                        track.get(
-                            "topology_v1",
-                            []
-                        )
+                q_it = (
+                    q_track.get(
+                        "interaction_topology",
+                        {}
                     )
                 )
 
-                topo_score_v2 = (
-                    self._sequence_similarity(
-                        q_track.get(
-                            "topology_v2",
-                            []
-                        ),
-                        track.get(
-                            "topology_v2",
-                            []
-                        )
+                c_it = (
+                    track.get(
+                        "interaction_topology",
+                        {}
                     )
                 )
 
-                topology_score = (
-                    topo_score_v1
-                    +
-                    topo_score_v2
-                ) / 2.0
+                topology_score = 0.0
+
+                parts = []
+
+                for key in (
+
+                    "shared_lane_ratio",
+
+                    "common_merge_points",
+
+                    "common_diverge_points",
+
+                    "shared_junctions"
+
+                ):
+
+                    qv = q_it.get(key)
+                    cv = c_it.get(key)
+
+                    if isinstance(qv, (int, float)) and \
+                    isinstance(cv, (int, float)):
+
+                        parts.append(
+                            1.0 - min(
+                                abs(qv - cv),
+                                1.0
+                            )
+                        )
+
+                    elif isinstance(qv, list) and \
+                        isinstance(cv, list):
+
+                        a = set(map(str, qv))
+                        b = set(map(str, cv))
+
+                        if a or b:
+                            parts.append(
+                                len(a & b) /
+                                max(len(a | b), 1)
+                            )
+
+                if parts:
+                    topology_score = (
+                        sum(parts)
+                        / len(parts)
+                    )
+                else:
+                    topology_score = 0.0
 
             except Exception:
                 pass
@@ -3496,8 +3630,35 @@ class LaneMapViewer(QWidget):
                     )
                 ),
 
-                track.get(
-                    "path_relationship"
+                round(
+                    track.get(
+                        "interaction_topology",
+                        {}
+                    ).get(
+                        "shared_lane_ratio",
+                        0.0
+                    ),
+                    2
+                ),
+
+                len(
+                    track.get(
+                        "interaction_topology",
+                        {}
+                    ).get(
+                        "shared_junctions",
+                        []
+                    )
+                ),
+
+                len(
+                    track.get(
+                        "interaction_topology",
+                        {}
+                    ).get(
+                        "common_merge_points",
+                        []
+                    )
                 )
             )
 
@@ -3536,10 +3697,16 @@ class LaneMapViewer(QWidget):
                 )
             )
 
+            it = track.get(
+                "interaction_topology",
+                {}
+            )
             item_text = (
                 f"{idx}. "
                 f"{r['score']:.3f} | "
-                f"{track.get('path_relationship')} | "
+                f"J={len(it.get('shared_junctions',[]))} "
+                f"M={len(it.get('common_merge_points',[]))} "
+                f"D={len(it.get('common_diverge_points',[]))}| "
                 f"{track.get('start_frame')}-"
                 f"{track.get('end_frame')}\n"
                 f"{seq}"
@@ -4099,10 +4266,11 @@ class LaneMapViewer(QWidget):
 
         return result
 
-    def _topology_transition_sequence(
+    def _build_route_semantics(
             self,
             timeline):
 
+        route = []
         transitions = []
 
         prev_lane = None
@@ -4121,149 +4289,445 @@ class LaneMapViewer(QWidget):
             if lane is None:
                 continue
 
+            lane = str(lane)
+
             if prev_lane is None:
+
+                route.append(lane)
                 prev_lane = lane
                 continue
 
             if lane == prev_lane:
                 continue
 
-            meta_prev = (
-                self.road.meta.get(
-                    str(prev_lane),
-                    {}
-                )
+            meta_prev = self.road.meta.get(
+                prev_lane,
+                {}
             )
 
-            succ = set(
-                map(
-                    str,
-                    meta_prev.get(
-                        "successors",
-                        []
-                    )
+            succ = {
+                str(x)
+                for x in meta_prev.get(
+                    "successors",
+                    []
                 )
-            )
+            }
 
-            adj = set(
-                map(
-                    str,
-                    meta_prev.get(
-                        "adjacent",
-                        []
-                    )
+            adj = {
+                str(x)
+                for x in meta_prev.get(
+                    "adjacent",
+                    []
                 )
-            )
+            }
 
-            lane_s = str(lane)
+            if lane in succ:
 
-            relation = "TRANSFER"
-
-            if lane_s in succ:
-
-                relation = (
+                transitions.append(
                     "DIVERGE"
                     if len(succ) > 1
                     else "FOLLOW"
                 )
 
-            elif lane_s in adj:
+            elif lane in adj:
 
-                relation = (
+                transitions.append(
                     "LANE_CHANGE"
                 )
 
-            transitions.append({
-                "from_lane":
-                    str(prev_lane),
-                "to_lane":
-                    lane_s,
-                "relation":
-                    relation
-            })
+            else:
+
+                transitions.append(
+                    "TRANSFER"
+                )
+
+            route.append(lane)
 
             prev_lane = lane
 
-        return transitions
+        return {
+            "route": route,
+            "transitions": transitions
+        }
+
+    def _build_topology_facts(
+            self,
+            ctx_a,
+            ctx_b):
+
+        meta = getattr(
+            self.road,
+            "meta",
+            {}
+        ) or {}
+
+        actor_facts = {}
+        routes = {}
+
+        for actor, ctx in (
+            ("A", ctx_a),
+            ("B", ctx_b)
+        ):
+
+            route = []
+            prev = None
+
+            for _, sample in sorted(
+                ctx.get(
+                    "timeline",
+                    {}
+                ).items()
+            ):
+
+                lane = sample.get(
+                    "region_id"
+                )
+
+                if lane is None:
+                    continue
+
+                lane = str(lane)
+
+                if lane != prev:
+                    route.append(lane)
+
+                prev = lane
+
+            routes[actor] = route
+
+            junctions = set()
+            merges = set()
+            diverges = set()
+            successors = set()
+            predecessors = set()
+
+            for lane in route:
+
+                m = meta.get(
+                    lane,
+                    {}
+                )
+
+                jid = m.get(
+                    "junction_id"
+                )
+
+                if jid is not None:
+                    junctions.add(
+                        str(jid)
+                    )
+
+                preds = {
+                    str(x)
+                    for x in m.get(
+                        "predecessors",
+                        []
+                    )
+                }
+
+                succs = {
+                    str(x)
+                    for x in m.get(
+                        "successors",
+                        []
+                    )
+                }
+
+                predecessors |= preds
+                successors |= succs
+
+                if len(preds) > 1:
+                    merges.add(lane)
+
+                if len(succs) > 1:
+                    diverges.add(lane)
+
+            actor_facts[actor] = {
+
+                "junctions":
+                    sorted(junctions),
+
+                "merge_points":
+                    sorted(merges),
+
+                "diverge_points":
+                    sorted(diverges),
+
+                "_successors":
+                    successors,
+
+                "_predecessors":
+                    predecessors,
+
+                "_route":
+                    route
+            }
+
+        route_a = actor_facts["A"]["_route"]
+        route_b = actor_facts["B"]["_route"]
+
+        shared_segments = []
+
+        common_route = sorted(
+            set(route_a) &
+            set(route_b)
+        )
+
+        if common_route:
+            shared_segments.append(
+                common_route
+            )
+
+        interaction = {
+
+            "shared_lanes":
+                common_route,
+
+            "shared_lane_ratio":
+                len(common_route) /
+                max(
+                    len(
+                        set(route_a)
+                        |
+                        set(route_b)
+                    ),
+                    1
+                ),
+
+            "shared_junctions": [],
+            "common_merge_points":
+                sorted(
+                    set(
+                        actor_facts["A"]["merge_points"]
+                    )
+                    &
+                    set(
+                        actor_facts["B"]["merge_points"]
+                    )
+                ),
+
+            "common_diverge_points":
+                sorted(
+                    set(
+                        actor_facts["A"]["diverge_points"]
+                    )
+                    &
+                    set(
+                        actor_facts["B"]["diverge_points"]
+                    )
+                ),
+
+            "common_successors":
+                sorted(
+                    actor_facts["A"]["_successors"]
+                    &
+                    actor_facts["B"]["_successors"]
+                ),
+
+            "common_predecessors":
+                sorted(
+                    actor_facts["A"]["_predecessors"]
+                    &
+                    actor_facts["B"]["_predecessors"]
+                ),
+
+            "shared_future_junctions":
+                sorted(
+                    set(
+                        actor_facts["A"]["junctions"]
+                    )
+                    &
+                    set(
+                        actor_facts["B"]["junctions"]
+                    )
+                ),
+
+            "shared_route_segments":
+                shared_segments
+        }
+
+        for actor in ("A", "B"):
+            actor_facts[actor].pop(
+                "_successors",
+                None
+            )
+            actor_facts[actor].pop(
+                "_predecessors",
+                None
+            )
+            actor_facts[actor].pop(
+                "_route",
+                None
+            )
+
+        return actor_facts, interaction
+
+    def _build_interaction_facts(
+            self,
+            pair):
+
+        return {
+            "timeline":
+                pair.get(
+                    "timeline",
+                    {}
+                ),
+
+            "summary": {
+                "distance_min":
+                    pair.get(
+                        "distance_min"
+                    ),
+
+                "distance_max":
+                    pair.get(
+                        "distance_max"
+                    ),
+
+                "ttc_min":
+                    pair.get(
+                        "ttc_min"
+                    )
+            }
+        }
+
+    def _build_pair_scenario_context(
+            self,
+            actor_a_id,
+            actor_b_id,
+            ctx_a,
+            ctx_b,
+            pair,
+            start_frame,
+            end_frame):
+
+        route_a = self._build_route_semantics(
+            ctx_a["timeline"]
+        )
+
+        route_b = self._build_route_semantics(
+            ctx_b["timeline"]
+        )
+
+        actor_topology, interaction_topology = (
+            self._build_topology_facts(
+                ctx_a,
+                ctx_b
+            )
+        )
+        pair_timeline = (
+            pair.get(
+                "timeline",
+                {}
+            )
+        )
+
+        shared_frames = []
+
+        for frame_id, sample in pair_timeline.items():
+
+            lane_rel = sample.get(
+                "lane_relation",
+                {}
+            )
+
+            if lane_rel.get(
+                "shared_junction",
+                False
+            ):
+                shared_frames.append(
+                    int(frame_id)
+                )
+
+        interaction_topology[
+            "shared_junctions"
+        ] = shared_frames
+        return {
+
+            "kind":
+                "map_scenario_context",
+
+            "version":
+                "1.0",
+
+            "context_version":
+                "map_scenario_context_v1",
+
+            "ready":
+                False,
+
+            "scope": {
+
+                "type":
+                    "pair_window",
+
+                "start_frame":
+                    int(start_frame),
+
+                "end_frame":
+                    int(end_frame)
+            },
+
+            "actors": {
+
+                "A": {
+
+                    "id":
+                        str(actor_a_id),
+
+                    "timeline":
+                        ctx_a["timeline"],
+
+                    "route_semantics":
+                        route_a,
+
+                    "topology_facts":
+                        actor_topology["A"]
+                },
+
+                "B": {
+
+                    "id":
+                        str(actor_b_id),
+
+                    "timeline":
+                        ctx_b["timeline"],
+
+                    "route_semantics":
+                        route_b,
+
+                    "topology_facts":
+                        actor_topology["B"]
+                }
+            },
+
+            "interaction_facts":
+                self._build_interaction_facts(
+                    pair
+                ),
+
+            "interaction_topology":
+                interaction_topology,
+
+            "duration_seconds":
+                float(
+                    self._get_valid_duration()
+                    or 1.0
+                ),
+
+            "meta":
+                getattr(
+                    self.road,
+                    "meta",
+                    {}
+                ) or {}
+        }
 
     def _topology_signature_from_timeline(
             self,
             timeline):
 
-        seq = []
-
-        frames = sorted(timeline)
-
-        prev_lane = None
-
-        for frame in frames:
-
-            data = timeline.get(frame)
-
-            if not data:
-                continue
-
-            lane = data.get(
-                "region_id"
-            )
-
-            if lane is None:
-                continue
-
-            if prev_lane is None:
-                prev_lane = lane
-                continue
-
-            if lane == prev_lane:
-                continue
-
-            meta_prev = (
-                self.road.meta.get(
-                    str(prev_lane),
-                    {}
-                )
-            )
-
-            relation = "TRANSFER"
-
-            succ = set(
-                map(
-                    str,
-                    meta_prev.get(
-                        "successors",
-                        []
-                    )
-                )
-            )
-
-            adj = set(
-                map(
-                    str,
-                    meta_prev.get(
-                        "adjacent",
-                        []
-                    )
-                )
-            )
-
-            lane_s = str(lane)
-
-            if lane_s in succ:
-
-                if len(succ) > 1:
-                    relation = "DIVERGE"
-                else:
-                    relation = "FOLLOW"
-
-            elif lane_s in adj:
-
-                relation = "LANE_CHANGE"
-
-            seq.append(relation)
-
-            prev_lane = lane
-
-        return seq
+        return []
 
     def build_semantic_timeline_database(self):
 
@@ -4613,18 +5077,18 @@ class LaneMapViewer(QWidget):
 
                         try:
 
-                            ctx1 = vehicle_ctx_cache[v1_id]
-                            ctx2 = vehicle_ctx_cache[v2_id]
+                            ctx_a = vehicle_ctx_cache[v1_id]
+                            ctx_b = vehicle_ctx_cache[v2_id]
 
                             tl1 = {
                                 k: v
-                                for k, v in ctx1["timeline"].items()
+                                for k, v in ctx_a["timeline"].items()
                                 if k in common
                             }
 
                             tl2 = {
                                 k: v
-                                for k, v in ctx2["timeline"].items()
+                                for k, v in ctx_b["timeline"].items()
                                 if k in common
                             }
 
@@ -4637,21 +5101,17 @@ class LaneMapViewer(QWidget):
                                 end_frame - start_frame
                             ) / max(self.fps, 1.0)
 
-                            ctx = {
-                                "ready": True,
-                                "vehicles": {
-                                    "V1": {"timeline": tl1},
-                                    "V2": {"timeline": tl2}
-                                },
-                                "pair": pair,
-                                "pairwise": pair,
-                                "duration_seconds": duration,
-                                "meta": getattr(
-                                    self.road,
-                                    "meta",
-                                    {}
-                                ) or {}
-                            }
+                            ctx = self._build_pair_scenario_context(
+                                actor_a_id=v1_id,
+                                actor_b_id=v2_id,
+                                ctx_a={"timeline": tl1},
+                                ctx_b={"timeline": tl2},
+                                pair=pair,
+                                start_frame=start_frame,
+                                end_frame=end_frame
+                            )
+
+                            ctx["ready"] = True
 
                             ctx = self.build_semantic_context(
                                 ctx
@@ -4668,18 +5128,41 @@ class LaneMapViewer(QWidget):
                                 )
                             )
 
-                            if not event_sequence:
+                            if (
+                                not event_sequence
+                                and
+                                len(common) < 100
+                            ):
                                 continue
-                            v1_topology = (
-                                self._topology_signature_from_timeline(
-                                    tl1
-                                )
+
+                            pair_ctx = self._build_pair_scenario_context(
+                                actor_a_id=v1_id,
+                                actor_b_id=v2_id,
+                                ctx_a={"timeline": tl1},
+                                ctx_b={"timeline": tl2},
+                                pair=pair,
+                                start_frame=start_frame,
+                                end_frame=end_frame
                             )
 
-                            v2_topology = (
-                                self._topology_signature_from_timeline(
-                                    tl2
-                                )
+                            actor_a_topology = (
+                                pair_ctx["actors"]
+                                        ["A"]
+                                        ["route_semantics"]
+                                        ["transitions"]
+                            )
+
+                            actor_b_topology = (
+                                pair_ctx["actors"]
+                                        ["B"]
+                                        ["route_semantics"]
+                                        ["transitions"]
+                            )
+
+                            interaction_topology = (
+                                pair_ctx[
+                                    "interaction_topology"
+                                ]
                             )
                             track = {
                                 "scope": "pair",
@@ -4690,22 +5173,19 @@ class LaneMapViewer(QWidget):
                                 "start_frame": start_frame,
                                 "end_frame": end_frame,
                                 "frame_count": len(common),
-
-                                "path_relationship":
-                                    ctx.get(
-                                        "path_relationship"
-                                    ),
+                                "interaction_topology":
+                                    interaction_topology,
 
                                 "topology_v1":
-                                    v1_topology,
+                                    actor_a_topology,
 
                                 "topology_v2":
-                                    v2_topology,
+                                    actor_b_topology,
 
                                 "topology_transitions":
                                 {
-                                    "V1": v1_topology,
-                                    "V2": v2_topology
+                                    "V1": actor_a_topology,
+                                    "V2": actor_b_topology
                                 },
 
                                 "event_sequence":
