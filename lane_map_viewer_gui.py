@@ -3521,7 +3521,6 @@ class LaneMapViewer(QWidget):
                         None
                     )
                 )
-
                 q_it = (
                     q_track.get(
                         "interaction_topology",
@@ -3536,54 +3535,95 @@ class LaneMapViewer(QWidget):
                     )
                 )
 
-                topology_score = 0.0
-
-                parts = []
+                scores = []
 
                 for key in (
-
                     "shared_lane_ratio",
-
-                    "common_merge_points",
-
-                    "common_diverge_points",
-
-                    "shared_junctions"
-
                 ):
 
-                    qv = q_it.get(key)
-                    cv = c_it.get(key)
+                    qv = float(
+                        q_it.get(key, 0.0)
+                    )
 
-                    if isinstance(qv, (int, float)) and \
-                    isinstance(cv, (int, float)):
+                    cv = float(
+                        c_it.get(key, 0.0)
+                    )
 
-                        parts.append(
-                            1.0 - min(
-                                abs(qv - cv),
-                                1.0
+                    scores.append(
+                        1.0
+                        -
+                        min(
+                            abs(qv - cv),
+                            1.0
+                        )
+                    )
+
+                for key in (
+                    "common_merge_points",
+                    "common_diverge_points"
+                ):
+
+                    a = set(
+                        map(
+                            str,
+                            q_it.get(key, [])
+                        )
+                    )
+
+                    b = set(
+                        map(
+                            str,
+                            c_it.get(key, [])
+                        )
+                    )
+
+                    if a or b:
+
+                        scores.append(
+                            len(a & b)
+                            /
+                            max(
+                                len(a | b),
+                                1
                             )
                         )
 
-                    elif isinstance(qv, list) and \
-                        isinstance(cv, list):
-
-                        a = set(map(str, qv))
-                        b = set(map(str, cv))
-
-                        if a or b:
-                            parts.append(
-                                len(a & b) /
-                                max(len(a | b), 1)
-                            )
-
-                if parts:
-                    topology_score = (
-                        sum(parts)
-                        / len(parts)
+                route_score_v1 = (
+                    self._sequence_similarity(
+                        q_track.get(
+                            "topology_v1",
+                            []
+                        ),
+                        track.get(
+                            "topology_v1",
+                            []
+                        )
                     )
-                else:
-                    topology_score = 0.0
+                )
+
+                route_score_v2 = (
+                    self._sequence_similarity(
+                        q_track.get(
+                            "topology_v2",
+                            []
+                        ),
+                        track.get(
+                            "topology_v2",
+                            []
+                        )
+                    )
+                )
+
+                scores.extend([
+                    route_score_v1,
+                    route_score_v2
+                ])
+
+                topology_score = (
+                    float(np.mean(scores))
+                    if scores
+                    else 0.0
+                )
 
             except Exception:
                 pass
@@ -3595,9 +3635,9 @@ class LaneMapViewer(QWidget):
             )
 
             score = (
-                0.75 * event_score
+                0.45 * event_score
                 +
-                0.25 * topology_score
+                0.55 * topology_score
             )
 
             if score < 0.15:
@@ -3619,44 +3659,26 @@ class LaneMapViewer(QWidget):
         for r in results:
 
             track = r["track"]
-
             sig = (
 
                 tuple(
-                    ev["event"]
-                    for ev in track.get(
+                    track.get(
+                        "topology_v1",
+                        []
+                    )
+                ),
+
+                tuple(
+                    track.get(
+                        "topology_v2",
+                        []
+                    )
+                ),
+
+                tuple(
+                    e["event_token"]
+                    for e in track.get(
                         "event_sequence",
-                        []
-                    )
-                ),
-
-                round(
-                    track.get(
-                        "interaction_topology",
-                        {}
-                    ).get(
-                        "shared_lane_ratio",
-                        0.0
-                    ),
-                    2
-                ),
-
-                len(
-                    track.get(
-                        "interaction_topology",
-                        {}
-                    ).get(
-                        "shared_junctions",
-                        []
-                    )
-                ),
-
-                len(
-                    track.get(
-                        "interaction_topology",
-                        {}
-                    ).get(
-                        "common_merge_points",
                         []
                     )
                 )
@@ -3689,8 +3711,11 @@ class LaneMapViewer(QWidget):
 
             track = r["track"]
 
-            seq = " → ".join(
-                ev["event"]
+            seq = " -> ".join(
+                ev.get(
+                    "event_token",
+                    ev["event"]
+                )
                 for ev in track.get(
                     "event_sequence",
                     []
@@ -3861,36 +3886,22 @@ class LaneMapViewer(QWidget):
         )
 
     def _event_similarity(
-        self,
-        query,
-        candidate
-    ):
+            self,
+            query,
+            candidate):
 
         if not query or not candidate:
             return 0.0
 
         q_events = [
-            e["event"]
+            e["event_token"]
             for e in query
         ]
 
         c_events = [
-            e["event"]
+            e["event_token"]
             for e in candidate
         ]
-
-        overlap = len(
-            set(q_events)
-            &
-            set(c_events)
-        )
-
-        if overlap == 0:
-            return 0.0
-
-        #
-        # event order
-        #
 
         order_score = (
             self._sequence_similarity(
@@ -3899,23 +3910,40 @@ class LaneMapViewer(QWidget):
             )
         )
 
-        #
-        # transition order
-        #
+        q_types = {
+            e["event"]
+            for e in query
+        }
 
-        q_trans = set(
-            zip(
+        c_types = {
+            e["event"]
+            for e in candidate
+        }
+
+        overlap_score = (
+            len(q_types & c_types)
+            /
+            max(
+                len(q_types | c_types),
+                1
+            )
+        )
+
+        q_trans = {
+            f"{a}>{b}"
+            for a, b in zip(
                 q_events[:-1],
                 q_events[1:]
             )
-        )
+        }
 
-        c_trans = set(
-            zip(
+        c_trans = {
+            f"{a}>{b}"
+            for a, b in zip(
                 c_events[:-1],
                 c_events[1:]
             )
-        )
+        }
 
         transition_score = (
             len(q_trans & c_trans)
@@ -3926,156 +3954,14 @@ class LaneMapViewer(QWidget):
             )
         )
 
-        #
-        # timing
-        #
-
-        timing_scores = []
-
-        q_by_type = {}
-        c_by_type = {}
-
-        for e in query:
-
-            q_by_type.setdefault(
-                e["event"],
-                []
-            ).append(e)
-
-        for e in candidate:
-
-            c_by_type.setdefault(
-                e["event"],
-                []
-            ).append(e)
-
-        for evt in (
-            set(q_by_type)
-            &
-            set(c_by_type)
-        ):
-
-            qa = q_by_type[evt][0]
-            ca = c_by_type[evt][0]
-
-            start_score = (
-                1.0
-                -
-                abs(
-                    qa["start_ratio"]
-                    -
-                    ca["start_ratio"]
-                )
-            )
-
-            dur_score = (
-                1.0
-                -
-                abs(
-                    qa["duration_ratio"]
-                    -
-                    ca["duration_ratio"]
-                )
-            )
-
-            timing_scores.append(
-                max(
-                    0.0,
-                    (
-                        start_score
-                        +
-                        dur_score
-                    )
-                    / 2.0
-                )
-            )
-
-        timing_score = (
-            float(np.mean(timing_scores))
-            if timing_scores
-            else 0.0
-        )
-
-        #
-        # role similarity
-        #
-        # actor swap is allowed
-        #
-
-        role_score = 0.0
-
-        shared_events = (
-            set(q_by_type)
-            &
-            set(c_by_type)
-        )
-
-        if shared_events:
-
-            matches = []
-
-            for evt in shared_events:
-
-                qa = q_by_type[evt][0]
-                ca = c_by_type[evt][0]
-
-                qp = set(
-                    qa.get(
-                        "participants",
-                        []
-                    )
-                )
-
-                cp = set(
-                    ca.get(
-                        "participants",
-                        []
-                    )
-                )
-
-                #
-                # exact match
-                #
-
-                if qp == cp:
-
-                    matches.append(1.0)
-
-                #
-                # same cardinality
-                # actorA <-> actorB swap
-                #
-
-                elif len(qp) == len(cp):
-
-                    matches.append(0.7)
-
-                else:
-
-                    matches.append(0.0)
-
-            role_score = (
-                float(np.mean(matches))
-                if matches
-                else 0.0
-            )
-
         return (
-
             0.40 * order_score
-
             +
-
-            0.20 * transition_score
-
+            0.30 * transition_score
             +
-
-            0.20 * timing_score
-
-            +
-
-            0.20 * role_score
+            0.30 * overlap_score
         )
+
 
     def _build_query_sequence(self):
 

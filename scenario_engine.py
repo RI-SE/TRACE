@@ -2951,28 +2951,21 @@ def embedding_similarity(v1, v2):
 
 
 def build_scenario_descriptor(
-    ctx: dict,
-    rules: list[RuleEntry]
-):
-    """
-    Retrieval-first scenario descriptor.
-
-    Event semantics are primary.
-    Rules, topology and kinematics are secondary.
-
-    Optimized for:
-        - semantic retrieval
-        - motif matching
-        - similarity search
-        - future vector indexing
-    """
+        ctx: dict,
+        rules: list[RuleEntry]):
 
     timeline = sorted(
         ctx.get(
             "_canonical_event_timeline",
-            ctx.get("event_timeline", [])
+            ctx.get(
+                "event_timeline",
+                []
+            )
         ),
-        key=lambda e: e.get("t_start", 0.0)
+        key=lambda e: e.get(
+            "t_start",
+            0.0
+        )
     )
 
     nodes = []
@@ -2981,317 +2974,157 @@ def build_scenario_descriptor(
     event_types = []
     rule_types = []
 
-    # ==================================================
-    # EVENT NODES
-    # ==================================================
-
-    for idx, evt in enumerate(timeline):
-
-        node_id = f"E{idx}"
-
-        t0 = evt.get("t_start")
-        t1 = evt.get("t_end")
-
-        duration = None
-
-        if (
-            isinstance(t0, (int, float))
-            and isinstance(t1, (int, float))
-        ):
-            duration = float(max(0.0, t1 - t0))
-
-        features = evt.get("features", {}) or {}
-        interaction = evt.get("interaction", {}) or {}
+    #
+    # --------------------------------------------------
+    # Events
+    # --------------------------------------------------
+    #
+    for i, evt in enumerate(timeline):
 
         etype = evt.get("type")
 
         if etype:
-            event_types.append(str(etype))
+            event_types.append(
+                str(etype)
+            )
 
-        nodes.append(
-            {
-                "id": node_id,
-                "node_type": "event",
-                "event_type": etype,
-                "participants": evt.get(
-                    "participants", []
+        nodes.append({
+
+            "id": f"E{i}",
+
+            "node_type": "event",
+
+            "event_type": etype,
+
+            "participants":
+                evt.get(
+                    "participants",
+                    []
                 ),
-                "t_start": t0,
-                "t_end": t1,
-                "duration_s": duration,
-                "region": evt.get("region"),
-                "metrics": {
-                    **features,
-                    **interaction
-                }
-            }
+
+            "t_start":
+                evt.get("t_start"),
+
+            "t_end":
+                evt.get("t_end"),
+
+            "region":
+                evt.get("region")
+        })
+
+    #
+    # --------------------------------------------------
+    # Rules
+    # --------------------------------------------------
+    #
+    for i, r in enumerate(rules):
+
+        subtype = (
+            (r.parameters or {})
+            .get("subtype")
         )
 
-    # ==================================================
-    # TEMPORAL GRAPH
-    # ==================================================
-
-    for i in range(len(timeline) - 1):
-
-        e1 = timeline[i]
-        e2 = timeline[i + 1]
-
-        a0 = e1.get("t_start")
-        a1 = e1.get("t_end")
-        b0 = e2.get("t_start")
-        b1 = e2.get("t_end")
-
-        if None in (a0, a1, b0, b1):
-            continue
-
-        edge = {
-            "from": f"E{i}",
-            "to": f"E{i+1}"
-        }
-
-        if a1 <= b0:
-
-            edge.update(
-                {
-                    "relation": "before",
-                    "gap_s": float(b0 - a1)
-                }
-            )
-
-        else:
-
-            overlap = min(a1, b1) - max(a0, b0)
-
-            edge.update(
-                {
-                    "relation": "overlaps",
-                    "overlap_s": float(
-                        max(overlap, 0.0)
-                    )
-                }
-            )
-
-        edges.append(edge)
-
-    # ==================================================
-    # RULE NODES
-    # ==================================================
-
-    indexed_events = []
-
-    for idx, evt in enumerate(timeline):
-
-        s = evt.get("t_start")
-        e = evt.get("t_end")
-
-        if (
-            isinstance(s, (int, float))
-            and isinstance(e, (int, float))
-        ):
-            indexed_events.append(
-                (s, e, idx)
-            )
-
-    indexed_events.sort()
-
-    for idx, rule in enumerate(rules):
-
-        params = rule.parameters or {}
-
-        node_id = f"R{idx}"
-
-        start_t = params.get("start_t")
-        end_t = params.get("end_t")
-
-        duration = None
-
-        if (
-            isinstance(start_t, (int, float))
-            and isinstance(end_t, (int, float))
-        ):
-            duration = float(
-                max(
-                    0.0,
-                    end_t - start_t
-                )
-            )
-
-        subtype = params.get("subtype")
-
         if subtype:
-            rule_types.append(str(subtype))
+            rule_types.append(
+                str(subtype)
+            )
 
-        nodes.append(
-            {
-                "id": node_id,
-                "node_type": "rule",
-                "rule_type": subtype,
-                "actor": rule.actor,
-                "confidence": float(
+        nodes.append({
+
+            "id": f"R{i}",
+
+            "node_type": "rule",
+
+            "rule_type": subtype,
+
+            "actor": r.actor,
+
+            "confidence":
+                float(
                     getattr(
-                        rule,
+                        r,
                         "confidence",
                         1.0
                     )
-                ),
-                "t_start": start_t,
-                "t_end": end_t,
-                "duration_s": duration,
-                "interaction": params.get(
-                    "interaction"
-                ),
-                "behavior": params.get(
-                    "behavior"
                 )
-            }
-        )
+        })
 
-        if not (
-            isinstance(start_t, (int, float))
-            and isinstance(end_t, (int, float))
-        ):
+    #
+    # --------------------------------------------------
+    # Actor-agnostic event chain
+    # --------------------------------------------------
+    #
+    actor_event_chain = []
+
+    for evt in timeline:
+
+        etype = evt.get("type")
+
+        if not etype:
             continue
 
-        for evt_start, evt_end, e_idx in indexed_events:
-
-            if evt_start > end_t:
-                break
-
-            if evt_end < start_t:
-                continue
-
-            edges.append(
-                {
-                    "from": f"E{e_idx}",
-                    "to": node_id,
-                    "relation": "supports"
-                }
+        participants = (
+            evt.get(
+                "participants",
+                []
             )
+        )
 
-    # ==================================================
-    # EVENT ORDER
-    # ==================================================
+        if len(participants) >= 2:
 
-    ordered_event_types = [
-        e.get("type")
-        for e in timeline
-        if e.get("type")
-    ]
+            role = "AB"
 
-    signature = "→".join(
-        ordered_event_types
+        elif len(participants) == 1:
+
+            role = "ONE"
+
+        else:
+
+            role = "UNK"
+
+        actor_event_chain.append(
+            f"{role}:{etype}"
+        )
+
+    actors = ctx.get(
+        "actors",
+        {}
     )
 
-    id_to_node = {
-        n["id"]: n
-        for n in nodes
-    }
-
-    # ==================================================
-    # TRANSITIONS
-    # ==================================================
-
-    transitions = []
-
-    for a, b in zip(
-        ordered_event_types[:-1],
-        ordered_event_types[1:]
-    ):
-        transitions.append(
-            f"{a}>{b}"
+    topo_a = (
+        actors.get(
+            "A",
+            {}
         )
-
-    # ==================================================
-    # EVENT -> RULE TRANSITIONS
-    # ==================================================
-
-    for edge in edges:
-
-        if edge.get("relation") != "supports":
-            continue
-
-        src = id_to_node.get(
-            edge["from"]
+        .get(
+            "route_semantics",
+            {}
         )
-
-        dst = id_to_node.get(
-            edge["to"]
+        .get(
+            "transitions",
+            []
         )
+    )
 
-        if not src or not dst:
-            continue
+    topo_b = (
+        actors.get(
+            "B",
+            {}
+        )
+        .get(
+            "route_semantics",
+            {}
+        )
+        .get(
+            "transitions",
+            []
+        )
+    )
 
-        ev = src.get("event_type")
-        rl = dst.get("rule_type")
-
-        if ev and rl:
-
-            transitions.append(
-                f"{ev}>{rl}"
-            )
-
-    # ==================================================
-    # MOTIFS
-    # ==================================================
-
-    motifs = []
-
-    motif_map = {
-        "lane_change>proximity":
-            "LC_PROX",
-        "waiting>merge":
-            "WAIT_MERGE",
-        "waiting>yield":
-            "WAIT_YIELD",
-        "lane_change>car_following":
-            "LC_FOLLOW",
-        "lane_change>dangerous_following":
-            "LC_DANGER_FOLLOW",
-        "proximity>near_miss_longitudinal":
-            "PROX_NEAR_MISS",
-        "proximity>near_miss_lateral":
-            "PROX_NEAR_MISS",
-        "proximity>avoidance":
-            "PROX_AVOIDANCE"
-    }
-
-    for t in transitions:
-
-        m = motif_map.get(t)
-
-        if m:
-            motifs.append(m)
-
-    # ==================================================
-    # ENGINE EVENT FINGERPRINT
-    # ==================================================
-
-    fingerprint = {
-        "event_chain":
-            ordered_event_types,
-
-        "event_count":
-            len(ordered_event_types),
-
-        "lane_change_count":
-            ordered_event_types.count(
-                "lane_change"
-            ),
-
-        "proximity_count":
-            ordered_event_types.count(
-                "proximity"
-            ),
-
-        "waiting_count":
-            ordered_event_types.count(
-                "waiting"
-            )
-    }
-
-    # ==================================================
-    # TOPOLOGY
-    # ==================================================
+    route_parts = sorted([
+        "→".join(topo_a),
+        "→".join(topo_b)
+    ])
 
     it = ctx.get(
         "interaction_topology",
@@ -3339,33 +3172,93 @@ def build_scenario_descriptor(
             )
     }
 
-    # ==================================================
-    # NUMERIC FEATURES
-    # ==================================================
-
-    signals = (
-        ctx.get("derived", {})
-           .get("signals", {})
+    topology_part = (
+        f"S{round(topology['shared_lane_fraction'],2)}"
+        f"_M{topology['common_merge_count']}"
+        f"_D{topology['common_diverge_count']}"
+        f"_J{topology['shared_junction_count']}"
     )
 
-    lane_change_count = (
+    signature = (
+        topology_part
+        + " || "
+        + " | ".join(route_parts)
+        + " || "
+        + " → ".join(actor_event_chain)
+    )
 
-        ctx.get(
-            "derived",
-            {}
-        ).get(
-            "v1_lane_change_count",
-            0
+    transitions = [
+
+        f"{a}>{b}"
+
+        for a, b in zip(
+            actor_event_chain[:-1],
+            actor_event_chain[1:]
         )
+    ]
 
-        +
+    motif_map = {
 
+        "ONE:waiting>AB:merge":
+            "WAIT_MERGE",
+
+        "ONE:waiting>AB:yield":
+            "WAIT_YIELD",
+
+        "AB:proximity>near_miss_longitudinal":
+            "PROX_NEAR_MISS",
+
+        "AB:proximity>near_miss_lateral":
+            "PROX_NEAR_MISS",
+
+        "AB:proximity>avoidance":
+            "PROX_AVOIDANCE"
+    }
+
+    motifs = [
+
+        motif_map[t]
+
+        for t in transitions
+
+        if t in motif_map
+    ]
+
+    fingerprint = {
+
+        "event_chain":
+            actor_event_chain,
+
+        "event_count":
+            len(actor_event_chain),
+
+        "lane_change_count":
+            sum(
+                "lane_change" in e
+                for e in actor_event_chain
+            ),
+
+        "proximity_count":
+            sum(
+                "proximity" in e
+                for e in actor_event_chain
+            ),
+
+        "waiting_count":
+            sum(
+                "waiting" in e
+                for e in actor_event_chain
+            )
+    }
+
+    signals = (
         ctx.get(
             "derived",
             {}
-        ).get(
-            "v2_lane_change_count",
-            0
+        )
+        .get(
+            "signals",
+            {}
         )
     )
 
@@ -3383,19 +3276,6 @@ def build_scenario_descriptor(
         "rule_count":
             len(rules),
 
-        "lane_change_count":
-            lane_change_count,
-
-        "waiting_count":
-            fingerprint[
-                "waiting_count"
-            ],
-
-        "proximity_count":
-            fingerprint[
-                "proximity_count"
-            ],
-
         "v1_avg_speed":
             signals.get(
                 "v1_avg_speed"
@@ -3411,30 +3291,22 @@ def build_scenario_descriptor(
                 "min_distance"
             ),
 
-        "max_distance":
-            signals.get(
-                "max_distance"
-            ),
-
-        "avg_closing_rate":
-            signals.get(
-                "avg_closing_rate"
-            ),
-
         "min_ttc":
-            ctx.get("min_ttc")
+            ctx.get(
+                "min_ttc"
+            )
     }
-
-    # ==================================================
-    # SEMANTIC SIGNATURE
-    # ==================================================
 
     semantic_signature = {
 
         "event_chain":
-            tuple(
-                ordered_event_types
-            ),
+            tuple(actor_event_chain),
+
+        "route_signature_A":
+            tuple(topo_a),
+
+        "route_signature_B":
+            tuple(topo_b),
 
         "event_types":
             sorted(
@@ -3454,47 +3326,13 @@ def build_scenario_descriptor(
         "motifs":
             sorted(
                 set(motifs)
-            ),
-
-        "fingerprint":
-            fingerprint
+            )
     }
-
-    # ==================================================
-    # WINDOW
-    # ==================================================
-
-    window_info = {
-
-        "scenario_id":
-            ctx.get(
-                "scenario_id",
-                "unknown_scenario"
-            ),
-
-        "window_id":
-            ctx.get(
-                "window_id",
-                "full_window"
-            ),
-
-        "t_start":
-            timeline[0].get("t_start")
-            if timeline else None,
-
-        "t_end":
-            timeline[-1].get("t_end")
-            if timeline else None
-    }
-
-    # ==================================================
-    # DESCRIPTOR
-    # ==================================================
 
     descriptor = {
 
         "descriptor_version":
-            "graph_v5_semantic",
+            "graph_v6_topology",
 
         "signature":
             signature,
@@ -3502,13 +3340,11 @@ def build_scenario_descriptor(
         "event_fingerprint":
             fingerprint,
 
-        "window":
-            window_info,
-
         "topology":
             topology,
 
         "graph": {
+
             "node_count":
                 len(nodes),
 
@@ -3554,19 +3390,19 @@ def build_scenario_descriptor(
 
     descriptor["embedding"] = (
         build_scenario_embedding(
-            timeline=timeline,
-            rules=rules,
-            topology=topology,
-            numeric_features=numeric_features,
-            search_index=descriptor[
+            timeline,
+            rules,
+            topology,
+            numeric_features,
+            descriptor[
                 "search_index"
             ]
         )
     )
 
-    descriptor["embedding_version"] = (
-        "semantic_v2"
-    )
+    descriptor[
+        "embedding_version"
+    ] = "semantic_v3"
 
     return descriptor
 
