@@ -318,6 +318,19 @@ def enrich_with_topology(ctx: Dict[str, Any]) -> Dict[str, Any]:
         # Never break pipeline
         pass
 
+    topo["v1_role_path"] = (
+        extract_semantic_role_sequence(
+            vehicles.get("V1", {}),
+            meta
+        )
+    )
+
+    topo["v2_role_path"] = (
+        extract_semantic_role_sequence(
+            vehicles.get("V2", {}),
+            meta
+        )
+    )
     ctx["topology"] = topo
     return ctx
 
@@ -485,7 +498,79 @@ def compute_headway_sd(v1_sd, v2_sd):
 # ============================================================
 # geometry & sampling
 # ============================================================
+def extract_semantic_role_sequence(
+        vehicle,
+        meta):
 
+    seq = []
+
+    tl = vehicle.get(
+        "timeline",
+        {}
+    )
+
+    for _, frame in sorted(
+        tl.items(),
+        key=lambda x: int(x[0])
+    ):
+
+        rid = frame.get(
+            "region_id"
+        )
+
+        if rid is None:
+            continue
+
+        entry = meta.get(
+            str(rid),
+            {}
+        )
+
+        role = []
+
+        if entry.get(
+            "is_connecting_road"
+        ):
+            role.append(
+                "CONNECTOR"
+            )
+
+        if entry.get(
+            "junction_id"
+        ) is not None:
+            role.append(
+                "JUNCTION"
+            )
+
+        pred = entry.get(
+            "predecessors",
+            []
+        ) or []
+
+        succ = entry.get(
+            "successors",
+            []
+        ) or []
+
+        if len(pred) == 0:
+            role.append("ENTRY")
+
+        if len(succ) == 0:
+            role.append("EXIT")
+
+        if not role:
+            role.append("FLOW")
+
+        tag = "|".join(role)
+
+        if (
+            not seq
+            or
+            seq[-1] != tag
+        ):
+            seq.append(tag)
+
+    return seq
 def extract_region_sequence(vehicle):
 
     tl = vehicle.get("timeline", {})
@@ -1468,6 +1553,62 @@ def build_engine_insight_context(
 # ============================================================
 # Events 
 # ============================================================
+def build_topology_events(ctx):
+
+    events = []
+
+    topo = ctx.get(
+        "topology",
+        {}
+    )
+
+    for actor, key in (
+        ("vehicle1", "v1_role_path"),
+        ("vehicle2", "v2_role_path")
+    ):
+
+        path = topo.get(
+            key,
+            []
+        )
+
+        if not path:
+            continue
+
+        if any(
+            "ENTRY" in x
+            for x in path
+        ):
+            events.append({
+                "type":
+                    "topology_entry",
+                "participants":
+                    [actor]
+            })
+
+        if any(
+            "CONNECTOR" in x
+            for x in path
+        ):
+            events.append({
+                "type":
+                    "topology_connector",
+                "participants":
+                    [actor]
+            })
+
+        if any(
+            "EXIT" in x
+            for x in path
+        ):
+            events.append({
+                "type":
+                    "topology_exit",
+                "participants":
+                    [actor]
+            })
+
+    return events
 
 def detect_events(ctx, events=None):
     events = list(events) if events else []
@@ -1634,7 +1775,6 @@ def detect_events(ctx, events=None):
                 "features": features,
                 "interaction": interaction
             })
-
     waiting_events = build_waiting_events(ctx)
 
     if waiting_events:
@@ -2779,16 +2919,23 @@ def suggest_rules_combined(
 
 
 def _is_lane_change_transition(
-    r_from: int,
-    r_to: int,
-    meta: Dict[str, Any]
-) -> bool:
+    r_from,
+    r_to,
+    meta
+):
 
     if r_from == r_to:
         return False
 
-    from_lanes = expand_region_to_lanes(r_from, meta)
-    to_lanes = expand_region_to_lanes(r_to, meta)
+    from_lanes = expand_region_to_lanes(
+        r_from,
+        meta
+    )
+
+    to_lanes = expand_region_to_lanes(
+        r_to,
+        meta
+    )
 
     for u in from_lanes:
 
@@ -2800,11 +2947,30 @@ def _is_lane_change_transition(
             if u == v:
                 continue
 
-            # normal forward progression
+            #
+            # Topological continuation
+            #
             if v in succ:
                 return False
 
-            # lateral move
+            #
+            # Connector continuation
+            #
+            mu = meta.get(str(u), {})
+            mv = meta.get(str(v), {})
+
+            if (
+                mu.get("junction_id") is not None
+                and
+                mu.get("junction_id")
+                ==
+                mv.get("junction_id")
+            ):
+                return False
+
+            #
+            # True lateral move
+            #
             if v in adj:
                 return True
 

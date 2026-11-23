@@ -8,6 +8,7 @@ import time
 from typing import List, Tuple
 import cv2
 import numpy as np
+from scipy.spatial import cKDTree
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF
 from PyQt6.QtGui import (
     QImage, QPixmap, QColor, QPen, QBrush, QPainterPath, QPolygonF
@@ -266,22 +267,27 @@ class LaneCanvas(QGraphicsView):
         if not viewer:
             return None
 
-        hover_index = getattr(viewer, "_hover_index", None)
+        tree = getattr(viewer, "_hover_tree", None)
+        index = getattr(viewer, "_hover_index", None)
 
-        if not hover_index:
+        if tree is None or not index:
             return None
 
-        best = None
-        best_dist = float("inf")
+        dist, pos = tree.query(
+            [float(x), float(y)],
+            k=1
+        )
 
-        for vid, idx, px, py in hover_index:
-            d = (px - x) ** 2 + (py - y) ** 2
+        if dist > self._hit_radius_px:
+            return None
 
-            if d < best_dist:
-                best_dist = d
-                best = (vid, idx, d ** 0.5)
+        vid, idx = index[pos]
 
-        return best if best and best[2] <= self._hit_radius_px else None
+        return (
+            vid,
+            idx,
+            float(dist)
+        )
 
 
     # ======================================================
@@ -414,6 +420,11 @@ class LaneMapViewer(QWidget):
         self._last_similarity_results = [] 
         self._similarity_items = []
         self._similarity_candidate = None        
+        self._vehicle_context_cache = {}
+        self._openlabel_vehicle_ctx_cache = {}
+        self._builder_traj_cache = {}
+        self._semantic_lane_roles = {}
+        self._centerline_geom_cache = {}
 
         if self.is_manual_mode:
             self._manual_traj_done = {"V1": False, "V2": False}
@@ -935,11 +946,176 @@ class LaneMapViewer(QWidget):
                 {
                     "world": world,
                     "region_id": rid,
-                    "sd": sd
+                    "sd": sd,
+
+                    "topology": (
+                        self._semantic_lane_roles.get(
+                            str(rid),
+                            ()
+                        )
+                        if rid is not None
+                        else ()
+                    )
                 }
             ))
 
         return out
+
+    def _build_semantic_lane_roles(self):
+
+        self._semantic_lane_roles = {}
+
+        if not self.road or not getattr(self.road, "meta", None):
+            return
+
+        meta = self.road.meta
+
+        for rid, info in meta.items():
+
+            if not isinstance(info, dict):
+                continue
+
+            rtype = str(
+                info.get("type", "")
+            )
+
+            if rtype not in (
+                "lane",
+                "connecting_lane"
+            ):
+                continue
+
+            succ = info.get(
+                "successors",
+                []
+            ) or []
+
+            pred = info.get(
+                "predecessors",
+                []
+            ) or []
+
+            role = []
+
+            if info.get(
+                "is_connecting_road",
+                False
+            ):
+                role.append(
+                    "CONNECTOR"
+                )
+
+            if len(pred) == 0:
+                role.append(
+                    "ENTRY"
+                )
+
+            if len(succ) == 0:
+                role.append(
+                    "EXIT"
+                )
+
+            if (
+                len(pred) > 0
+                and
+                len(succ) > 0
+                and
+                not info.get(
+                    "is_connecting_road",
+                    False
+                )
+            ):
+                role.append(
+                    "FLOW"
+                )
+
+            if len(succ) >= 2:
+                role.append(
+                    "SPLIT"
+                )
+
+            if len(pred) >= 2:
+                role.append(
+                    "MERGE"
+                )
+            junction_id = info.get(
+                "junction_id"
+            )
+
+            if junction_id is not None:
+                role.append(
+                    f"JUNCTION_{junction_id}"
+                )
+
+            self._semantic_lane_roles[
+                str(rid)
+            ] = tuple(role)
+    def _get_lane_semantic_debug(self, lane_id):
+
+        roles = self._semantic_lane_roles.get(
+            str(lane_id),
+            ()
+        )
+
+        rc = None
+
+        try:
+            rc = self.road.get_region_context(
+                lane_id
+            )
+        except Exception:
+            pass
+
+        if not rc:
+            return {}
+
+        return {
+            "roles": list(roles),
+            "successors": rc.get("successors", []),
+            "predecessors": rc.get("predecessors", []),
+            "adjacent": rc.get("adjacent", [])
+        }
+    def _get_centerline_geom(self, lane_id):
+
+        cached = self._centerline_geom_cache.get(lane_id)
+        if cached is not None:
+            return cached
+
+        reg = self.road.regions.get(lane_id)
+        if not reg:
+            return None
+
+        cl = getattr(reg, "centerline", None)
+        if not cl or len(cl) < 2:
+            return None
+
+        pts = np.asarray(cl, dtype=np.float64)
+
+        p1 = pts[:-1]
+        p2 = pts[1:]
+
+        v = p2 - p1
+
+        seg_len = np.linalg.norm(v, axis=1)
+
+        valid = seg_len > 1e-6
+
+        cumulative = np.zeros(len(seg_len) + 1)
+        cumulative[1:] = np.cumsum(seg_len)
+
+        result = {
+            "pts": pts,
+            "p1": p1,
+            "p2": p2,
+            "v": v,
+            "seg_len": seg_len,
+            "valid": valid,
+            "cumulative": cumulative
+        }
+
+        self._centerline_geom_cache[lane_id] = result
+
+        return result
 
     def _valid_proj(self, proj):
         if not proj:
@@ -957,51 +1133,75 @@ class LaneMapViewer(QWidget):
 
 
     def _project_to_centerline(self, lane_id, wp):
-        reg = self.road.regions.get(lane_id)
-        if not reg:
+
+        geom = self._get_centerline_geom(lane_id)
+
+        if not geom:
             return None
 
-        cl = getattr(reg, "centerline", None)
-        if not cl or len(cl) < 2:
-            return None
-
-        pts = np.asarray(cl)
-        px, py = wp[0], wp[1]
+        px = float(wp[0])
+        py = float(wp[1])
 
         best_s = None
         best_d = None
         best_dist = float("inf")
-        accum_s = 0.0
 
-        for i in range(len(pts) - 1):
-            p1 = pts[i]
-            p2 = pts[i + 1]
+        q = np.array([px, py], dtype=np.float64)
 
-            v = p2 - p1
-            w = np.array([px, py]) - p1
+        p1_arr = geom["p1"]
+        v_arr = geom["v"]
+        seg_len_arr = geom["seg_len"]
+        valid_arr = geom["valid"]
+        cumulative = geom["cumulative"]
 
-            seg_len = np.linalg.norm(v)
-            if seg_len < 1e-6:
+        for i in range(len(v_arr)):
+
+            if not valid_arr[i]:
                 continue
 
-            t = np.clip(np.dot(w, v) / (seg_len ** 2), 0.0, 1.0)
+            p1 = p1_arr[i]
+            v = v_arr[i]
+            seg_len = seg_len_arr[i]
+
+            w = q - p1
+
+            t = np.dot(w, v) / (seg_len * seg_len)
+
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+
             proj = p1 + t * v
 
-            dist = np.linalg.norm(np.array([px, py]) - proj)
+            diff = q - proj
+            dist = np.hypot(diff[0], diff[1])
 
             if dist < best_dist:
-                best_dist = dist
-                best_s = accum_s + t * seg_len
-                normal = np.array([-v[1], v[0]])
-                sign = np.sign(np.dot(w, normal))
-                best_d = sign * dist
 
-            accum_s += seg_len
+                best_dist = dist
+
+                best_s = cumulative[i] + (t * seg_len)
+
+                normal = np.array(
+                    [-v[1], v[0]],
+                    dtype=np.float64
+                )
+
+                sign = np.sign(
+                    np.dot(w, normal)
+                )
+
+                best_d = sign * dist
 
         if best_s is None:
             return None
 
-        return {"s": best_s, "d": best_d}
+        return {
+            "s": float(best_s),
+            "d": float(best_d)
+        }
+
 
     
     # ===================== NEW MAIN LAYOUT =====================
@@ -1339,6 +1539,7 @@ class LaneMapViewer(QWidget):
             self._clear_all_waypoints()
             self._manual_traj_done = {"V1": False, "V2": False}
             self._traj_map_manual.clear()
+            self._vehicle_context_cache.clear()
             self._world_polylines_manual = {"V1": None, "V2": None}
         else:
             self.clear_all_trajectories()
@@ -1493,14 +1694,21 @@ class LaneMapViewer(QWidget):
 
     def _rebuild_hover_index(self):
         self._hover_index = []
+        self._hover_tree = None
 
         traj_map = self._get_active_traj_map()
 
+        points = []
+        meta = []
+
         for vid, traj in traj_map.items():
             for idx, (_, x, y) in enumerate(traj):
-                self._hover_index.append(
-                    (vid, idx, float(x), float(y))
-                )
+                points.append((float(x), float(y)))
+                meta.append((vid, idx))
+
+        if points:
+            self._hover_tree = cKDTree(points)
+            self._hover_index = meta
 
     def _get_active_traj_map(self):
         if self.is_manual_mode:
@@ -1508,6 +1716,43 @@ class LaneMapViewer(QWidget):
         elif self.active_mode == "json":
             return self._traj_map_json
         return {}
+
+    def _rebuild_vehicle_context_cache(self):
+        """
+        Cache vehicle trajectory lookups.
+
+        Safe optimization:
+        only derived data, no behavioural changes.
+        """
+
+        self._vehicle_context_cache.clear()
+
+        traj_map = self._get_active_traj_map()
+
+        for vid, traj in traj_map.items():
+
+            frame_lookup = {}
+            frames = []
+
+            for fr, x, y in traj:
+                fr_i = int(fr)
+
+                frame_lookup[fr_i] = (
+                    float(x),
+                    float(y)
+                )
+
+                frames.append(fr_i)
+
+            if frames:
+                self._vehicle_context_cache[vid] = {
+                    "frame_lookup": frame_lookup,
+                    "frames": frames,
+                    "frame_set": set(frames),
+                    "first_frame": frames[0],
+                    "last_frame": frames[-1],
+                    "length": len(frames)
+                }
 
     def _get_active_store(self):
         return {
@@ -1604,7 +1849,23 @@ class LaneMapViewer(QWidget):
 
         if not pair or not pair.get("timeline"):
             return self._fail_ctx(ctx, "empty_pairwise")
+        v1_topology = (
+            self._topology_transition_sequence(
+                ctx1.get(
+                    "timeline",
+                    {}
+                )
+            )
+        )
 
+        v2_topology = (
+            self._topology_transition_sequence(
+                ctx2.get(
+                    "timeline",
+                    {}
+                )
+            )
+        )
         ctx.update({
             "ready": False,
             "state": "pair_ready",
@@ -1617,7 +1878,10 @@ class LaneMapViewer(QWidget):
             "pair": pair,
             "duration_seconds": float(self._get_valid_duration() or 1.0),
             "context_version": "timeline_v2",
-
+            "topology": {
+                "V1": v1_topology,
+                "V2": v2_topology
+            },
             "meta": getattr(self.road, "meta", {}) or {},
         })
 
@@ -2281,6 +2545,7 @@ class LaneMapViewer(QWidget):
 
         store["traj_map"][v] = traj
         store["world"][v] = world_pts
+        self._rebuild_vehicle_context_cache()
 
         color = QColor("green") if v == "V1" else QColor("cyan")
 
@@ -2346,6 +2611,8 @@ class LaneMapViewer(QWidget):
                     meta=self.view.meta
                 )
                 self.road.populate_centerlines(region_type=["lane", "connecting_lane"])
+                self._centerline_geom_cache.clear()
+                self._build_semantic_lane_roles()
                 self.log_info("RoadInfrastructure initialized")
             except Exception as e:
                 self.log_warn(f"RoadInfrastructure failed: {e}")
@@ -2421,6 +2688,8 @@ class LaneMapViewer(QWidget):
             frames, traj_map, fmin, fmax = load_openlabel(path)
             self.openlabel_frames = frames
             self.openlabel_traj_map = traj_map
+            self._builder_traj_cache.clear()
+            self._openlabel_vehicle_ctx_cache.clear()
             self.openlabel_fmin = fmin
             self.openlabel_fmax = fmax
 
@@ -2623,12 +2892,25 @@ class LaneMapViewer(QWidget):
             t = md.get("type", "unknown")
 
             if t in ("lane", "connecting_lane"):
+                semantic = self._get_lane_semantic_debug(
+                    rid
+                )
+
+                sem_txt = ",".join(
+                    semantic.get("roles", [])
+                )
+
+                if sem_txt:
+                    sem_txt = f" | SEM:{sem_txt}"
+                else:
+                    sem_txt = ""                
                 adj = md.get("adjacent", [])
                 suc = md.get("successors", [])
                 pre = md.get("predecessors", [])
 
                 line1 = (
-                    f"R{rid} | {t} | "
+                    f"R{rid} | {t}"
+                    f"{sem_txt} | "
                     f"Adjacent:{adj if adj else '-'} | "
                     f"Successors:{suc if suc else '-'} | "
                     f"Predecessors:{pre if pre else '-'}"
@@ -2888,6 +3170,7 @@ class LaneMapViewer(QWidget):
                 "V1": w1,
                 "V2": w2
             })
+            self._rebuild_vehicle_context_cache()
 
             for v, pts, color in [
                 ("V1", px1, QColor("green")),
@@ -3124,10 +3407,63 @@ class LaneMapViewer(QWidget):
                 < 1
             ):
                 continue
+            topology_score = 0.0
 
-            score = self._event_similarity(
-                query_sequence,
-                cand_sequence
+            try:
+
+                q_track = (
+                    getattr(
+                        self.scenario_gui,
+                        "_selected_track",
+                        None
+                    )
+                )
+
+                topo_score_v1 = (
+                    self._sequence_similarity(
+                        q_track.get(
+                            "topology_v1",
+                            []
+                        ),
+                        track.get(
+                            "topology_v1",
+                            []
+                        )
+                    )
+                )
+
+                topo_score_v2 = (
+                    self._sequence_similarity(
+                        q_track.get(
+                            "topology_v2",
+                            []
+                        ),
+                        track.get(
+                            "topology_v2",
+                            []
+                        )
+                    )
+                )
+
+                topology_score = (
+                    topo_score_v1
+                    +
+                    topo_score_v2
+                ) / 2.0
+
+            except Exception:
+                pass
+            event_score = (
+                self._event_similarity(
+                    query_sequence,
+                    cand_sequence
+                )
+            )
+
+            score = (
+                0.75 * event_score
+                +
+                0.25 * topology_score
             )
 
             if score < 0.15:
@@ -3227,6 +3563,7 @@ class LaneMapViewer(QWidget):
             f"candidate matches found."
         )
         return
+
 
 
     def load_semantic_database(self, path):
@@ -3749,6 +4086,185 @@ class LaneMapViewer(QWidget):
 
         return False    
 
+
+    def _get_cached_builder_traj(self, oid, traj):
+        cached = self._builder_traj_cache.get(oid)
+
+        if cached is not None:
+            return cached
+
+        result = self._traj_to_builder_format(traj)
+
+        self._builder_traj_cache[oid] = result
+
+        return result
+
+    def _topology_transition_sequence(
+            self,
+            timeline):
+
+        transitions = []
+
+        prev_lane = None
+
+        for frame_id in sorted(timeline):
+
+            sample = timeline.get(frame_id)
+
+            if not sample:
+                continue
+
+            lane = sample.get(
+                "region_id"
+            )
+
+            if lane is None:
+                continue
+
+            if prev_lane is None:
+                prev_lane = lane
+                continue
+
+            if lane == prev_lane:
+                continue
+
+            meta_prev = (
+                self.road.meta.get(
+                    str(prev_lane),
+                    {}
+                )
+            )
+
+            succ = set(
+                map(
+                    str,
+                    meta_prev.get(
+                        "successors",
+                        []
+                    )
+                )
+            )
+
+            adj = set(
+                map(
+                    str,
+                    meta_prev.get(
+                        "adjacent",
+                        []
+                    )
+                )
+            )
+
+            lane_s = str(lane)
+
+            relation = "TRANSFER"
+
+            if lane_s in succ:
+
+                relation = (
+                    "DIVERGE"
+                    if len(succ) > 1
+                    else "FOLLOW"
+                )
+
+            elif lane_s in adj:
+
+                relation = (
+                    "LANE_CHANGE"
+                )
+
+            transitions.append({
+                "from_lane":
+                    str(prev_lane),
+                "to_lane":
+                    lane_s,
+                "relation":
+                    relation
+            })
+
+            prev_lane = lane
+
+        return transitions
+
+    def _topology_signature_from_timeline(
+            self,
+            timeline):
+
+        seq = []
+
+        frames = sorted(timeline)
+
+        prev_lane = None
+
+        for frame in frames:
+
+            data = timeline.get(frame)
+
+            if not data:
+                continue
+
+            lane = data.get(
+                "region_id"
+            )
+
+            if lane is None:
+                continue
+
+            if prev_lane is None:
+                prev_lane = lane
+                continue
+
+            if lane == prev_lane:
+                continue
+
+            meta_prev = (
+                self.road.meta.get(
+                    str(prev_lane),
+                    {}
+                )
+            )
+
+            relation = "TRANSFER"
+
+            succ = set(
+                map(
+                    str,
+                    meta_prev.get(
+                        "successors",
+                        []
+                    )
+                )
+            )
+
+            adj = set(
+                map(
+                    str,
+                    meta_prev.get(
+                        "adjacent",
+                        []
+                    )
+                )
+            )
+
+            lane_s = str(lane)
+
+            if lane_s in succ:
+
+                if len(succ) > 1:
+                    relation = "DIVERGE"
+                else:
+                    relation = "FOLLOW"
+
+            elif lane_s in adj:
+
+                relation = "LANE_CHANGE"
+
+            seq.append(relation)
+
+            prev_lane = lane
+
+        return seq
+
     def build_semantic_timeline_database(self):
 
         if not self.openlabel_traj_map:
@@ -3810,7 +4326,7 @@ class LaneMapViewer(QWidget):
             # Vehicle contexts
             # --------------------------------------------------
 
-            vehicle_ctx_cache = {}
+            vehicle_ctx_cache = self._openlabel_vehicle_ctx_cache
 
             progress_ctx = QProgressDialog(
                 "Precomputing vehicle contexts...",
@@ -3830,17 +4346,16 @@ class LaneMapViewer(QWidget):
                     return
 
                 try:
-
-                    vehicle_ctx_cache[oid] = (
-                        self._ctx_builder.build_vehicle_context(
-                            self._traj_to_builder_format(
-                                vehicle_cache[oid]["traj"]
+                    if oid not in vehicle_ctx_cache:
+                        builder_traj = self._traj_to_builder_format(
+                            vehicle_cache[oid]["traj"]
+                        )
+                        vehicle_ctx_cache[oid] = (
+                            self._ctx_builder.build_vehicle_context(
+                                builder_traj
                             )
                         )
-                    )
-
                 except Exception as e:
-
                     print(
                         f"[CTX CACHE] {oid}: {e}"
                     )
@@ -4155,26 +4670,43 @@ class LaneMapViewer(QWidget):
 
                             if not event_sequence:
                                 continue
+                            v1_topology = (
+                                self._topology_signature_from_timeline(
+                                    tl1
+                                )
+                            )
 
+                            v2_topology = (
+                                self._topology_signature_from_timeline(
+                                    tl2
+                                )
+                            )
                             track = {
-
                                 "scope": "pair",
-
                                 "actor_ids": [
                                     str(v1_id),
                                     str(v2_id)
                                 ],
-
                                 "start_frame": start_frame,
-
                                 "end_frame": end_frame,
-
                                 "frame_count": len(common),
 
                                 "path_relationship":
                                     ctx.get(
                                         "path_relationship"
                                     ),
+
+                                "topology_v1":
+                                    v1_topology,
+
+                                "topology_v2":
+                                    v2_topology,
+
+                                "topology_transitions":
+                                {
+                                    "V1": v1_topology,
+                                    "V2": v2_topology
+                                },
 
                                 "event_sequence":
                                     event_sequence,
@@ -4184,14 +4716,16 @@ class LaneMapViewer(QWidget):
 
                                 "event_stats":
                                     stats,
+
                                 "event_fingerprint":
-                                sorted(
-                                    set(
-                                        e["event"]
-                                        for e in event_sequence
+                                    sorted(
+                                        set(
+                                            e["event"]
+                                            for e in event_sequence
+                                        )
                                     )
-                                )                                    
                             }
+
 
                             first_track = self._write_track(
                                 out,
