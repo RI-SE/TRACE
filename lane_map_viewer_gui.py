@@ -3442,19 +3442,17 @@ class LaneMapViewer(QWidget):
             self.log_info("Suggested Candidate Windows" + msg)
             return
 
-        # ---------- Guardrails for JSON / base scenario path ----------
-        if self.active_mode != "json":
-            self.log_warn("Switch to JSON mode to use candidate finder.")
-            return
-        if not self.openlabel_traj_map or not self.openlabel_frames:
-            self.log_warn("Load OpenLABEL JSON first.")
-            return
+        # ---------- Guardrails (mode-aware) ----------
+        #
+        if self.active_mode == "json":
+            if not self.openlabel_traj_map or not self.openlabel_frames:
+                self.log_warn("Load OpenLABEL JSON first.")
+                return
         if not self.scenario_gui:
             self.log_warn(
                 "Scenario GUI not connected."
             )
             return
-
 
         # --- Target signature from ScenarioRuleGUI (base) ---
         base_ctx = (
@@ -3462,16 +3460,15 @@ class LaneMapViewer(QWidget):
             or {}
         )
 
-
-        # --- Reference window length from GUI (as before) ---
         try:
             fstart_cur = int(self.global_start_box.currentText())
             fend_cur = int(self.global_end_box.currentText())
-        except:
-            self.log_warn("Invalid frames", "Select a valid global frame range.")
-            return
-        if fstart_cur > fend_cur:
-            fstart_cur, fend_cur = fend_cur, fstart_cur
+            if fstart_cur > fend_cur:
+                fstart_cur, fend_cur = fend_cur, fstart_cur
+        except Exception:
+            fstart_cur = None
+            fend_cur = None
+
 
         # ---------- Case B: Base scenario present & precomp enabled: evaluate only candidate windows ----------
         db = getattr(
@@ -3512,10 +3509,17 @@ class LaneMapViewer(QWidget):
         query_sequence = self._build_query_sequence()
 
         if not query_sequence:
-            self.log_warn(
-                "Current scenario has no event sequence."
-            )
+            if self.is_manual_mode:
+                self.log_warn(
+                    "Manual scenario has no event sequence. "
+                    "Generate V1+V2 trajectories and press Apply first."
+                )
+            else:
+                self.log_warn(
+                    "Current scenario has no event sequence."
+                )
             return
+
 
         tracks = db.get(
             "tracks",
