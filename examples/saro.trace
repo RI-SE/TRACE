@@ -1,7 +1,12 @@
 {
-  "mask": "./examples/Saro_lanelet20260622.png",
-  "layout": "./examples/Saro_lanelet20260622.json",
-  "homography": "./examples/saro_geojson.json",
-  "xodr": "./examples/SaroRound_2lane.xodr",
-  "openlabel": "./examples/An_VIDa_2025-10-16T134059CEST_D_clean.json"
+  "mask": "D:/Techtest/SYNERGIES/github/TRACE/examples/Saro_lanelet20260622.png",
+  "layout": "D:/Techtest/SYNERGIES/github/TRACE/examples/Saro_lanelet20260622.json",
+  "homography": "D:/Techtest/SYNERGIES/github/TRACE/examples/saro_geojson.json",
+  "xodr": "D:/Techtest/SYNERGIES/github/TRACE/examples/SaroRound_2lane.xodr",
+  "openlabel": "D:/Techtest/SYNERGIES/github/TRACE/examples/An_VIDa_2025-10-16T134059CEST_D_clean.json",
+  "db": "D:/Techtest/SYNERGIES/github/TRACE/examples/event_sequence_db.json",
+  "waypoints": {
+    "V1": [],
+    "V2": []
+  }
 }

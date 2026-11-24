@@ -130,6 +130,13 @@ class ScenarioRuleGUI(QWidget):
     def set_xodr_path(self, xodr_path: str):
         self.xodr_path = xodr_path
 
+    def reset_vehicle_contexts(self):
+        """Called by the viewer when the active scenario is invalidated."""
+        self._engine_context = None
+        self._rules = []
+        self.rule_table.setRowCount(0)
+        self.btn_explain.setEnabled(False)
+
     def set_pixel_polyline(self, vehicle: str, pixel_json: str):
         poly = json.loads(pixel_json) if pixel_json else None
         if vehicle == "V1":

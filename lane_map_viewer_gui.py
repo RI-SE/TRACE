@@ -14,8 +14,9 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QLabel,
     QGraphicsView, QGraphicsScene, QGraphicsPathItem, QComboBox, QMessageBox,
     QSplitter, QSizePolicy, QProgressDialog, QApplication, QDoubleSpinBox,
-    QSpinBox, QTextEdit, QListWidget, QListWidgetItem,
+    QSpinBox, QTextEdit, QListWidget, QListWidgetItem, QCheckBox,
 )
+
 from scipy.spatial import cKDTree
 
 from scenario_engine import (
@@ -110,7 +111,12 @@ class LaneCanvas(QGraphicsView):
         self._hit_radius_px = 10
         self.manual_waypoints = {"V1": [], "V2": []}
         self.wp_items = {"V1": [], "V2": []}
+        self.wp_line = {"V1": None, "V2": None}   # U3: live preview polyline per vehicle
         self._viewer_cache = None
+        # U1: right-drag panning state
+        self._panning = False
+        self._pan_last = None
+        self._pan_moved = False
 
     # ---------------- data ----------------
     def load_mask(self, path: str):
@@ -191,11 +197,15 @@ class LaneCanvas(QGraphicsView):
     def enable_waypoints(self, vehicle: str):
         self.mode = "waypoints"
         self.active_vehicle = vehicle
+        self.setCursor(Qt.CursorShape.CrossCursor)   # U3: visible mode feedback
 
     def clear_waypoints(self, vehicle=None):
         for v in ([vehicle] if vehicle else ("V1", "V2")):
             self._clear_items(self.wp_items[v])
             self.manual_waypoints[v].clear()
+            if self.wp_line.get(v) is not None:      # U3: remove the live polyline too
+                self.scene.removeItem(self.wp_line[v])
+                self.wp_line[v] = None
 
     def _draw_waypoints(self, vehicle):
         pts = self.manual_waypoints[vehicle]
@@ -211,6 +221,19 @@ class LaneCanvas(QGraphicsView):
                 dot.setZValue(60)
                 items.append(dot)
 
+        # U3: live dashed polyline so click order / start-end is visible before Generate
+        line = self.wp_line[vehicle]
+        if line is None:
+            line = QGraphicsPathItem()
+            line.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+            line.setZValue(55)
+            self.scene.addItem(line)
+            self.wp_line[vehicle] = line
+        if len(pts) >= 2:
+            line.setPath(polyline_path(pts))
+        else:
+            line.setPath(QPainterPath())
+
     # ---------------- interaction ----------------
     def in_image_bounds(self, x, y):
         return self.mask is not None and 0 <= x < self.mask.shape[1] and 0 <= y < self.mask.shape[0]
@@ -224,34 +247,70 @@ class LaneCanvas(QGraphicsView):
         if tree is None or not index:
             return None
         dist, pos = tree.query([float(x), float(y)], k=1)
-        if dist > self._hit_radius_px:
+        # U15: tree distance is in scene units - convert the pixel radius
+        radius = self._hit_radius_px / max(self.transform().m11(), 1e-3)
+        if dist > radius:
             return None
         vid, idx = index[pos]
         return vid, idx, float(dist)
+
 
     def _scene_int(self, ev):
         p = self.mapToScene(ev.pos())
         return int(p.x()), int(p.y())
 
     def wheelEvent(self, e):
-        s = 1.2 if e.angleDelta().y() > 0 else 1 / 1.2
-        self.scale(s, s)
+        if self.pixmap_item is None:
+            return
+        factor = 1.2 if e.angleDelta().y() > 0 else 1 / 1.2
+        s = self.transform().m11()
+        if not (0.05 <= s * factor <= 40.0):         # U1: sane zoom bounds
+            return
+        before = self.mapToScene(e.position().toPoint())
+        self.scale(factor, factor)
+        after = self.mapToScene(e.position().toPoint())
+        # U1: keep the point under the cursor fixed (was: zoom about top-left corner)
+        h, v = self.horizontalScrollBar(), self.verticalScrollBar()
+        h.setValue(h.value() + int((after.x() - before.x()) * self.transform().m11()))
+        v.setValue(v.value() + int((after.y() - before.y()) * self.transform().m22()))
+
 
     def mousePressEvent(self, ev):
         x, y = self._scene_int(ev)
+        # U1: right button = pan (a right *click* without movement deletes a waypoint)
+        if ev.button() == Qt.MouseButton.RightButton:
+            self._panning = True
+            self._pan_last = ev.position()
+            self._pan_moved = False
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            ev.accept()
+            return
         if self.mode == "waypoints" and self.active_vehicle:
             pts = self.manual_waypoints[self.active_vehicle]
+            tol = 8 / max(self.transform().m11(), 1e-3)   # U3: 8 px on screen, any zoom
             for i, (wx, wy) in enumerate(pts):
-                if abs(x - wx) <= 8 and abs(y - wy) <= 8:
+                if abs(x - wx) <= tol and abs(y - wy) <= tol:
                     self.dragging_wp = (self.active_vehicle, i)
                     return
+            if not self.in_image_bounds(x, y):             # U3: no waypoints outside the mask
+                return
             pts.append((x, y))
             self._draw_waypoints(self.active_vehicle)
             return
         self.clicked.emit(x, y)
         super().mousePressEvent(ev)
 
+
     def mouseMoveEvent(self, ev):
+        if self._panning:                                  # U1: right-drag pan
+            delta = ev.position() - self._pan_last
+            self._pan_last = ev.position()
+            if abs(int(delta.x())) + abs(int(delta.y())) > 3:
+                self._pan_moved = True
+            h, v = self.horizontalScrollBar(), self.verticalScrollBar()
+            h.setValue(h.value() - int(delta.x()))
+            v.setValue(v.value() - int(delta.y()))
+            return
         x, y = self._scene_int(ev)
         viewer = self._find_viewer()
         rid, md = None, {}
@@ -273,9 +332,44 @@ class LaneCanvas(QGraphicsView):
             return
         super().mouseMoveEvent(ev)
 
+
     def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.RightButton and self._panning:
+            self._panning = False
+            # U3: right *click* (no movement) on a waypoint deletes it
+            if (not self._pan_moved and self.mode == "waypoints"
+                    and self.active_vehicle):
+                x, y = self._scene_int(ev)
+                pts = self.manual_waypoints[self.active_vehicle]
+                tol = 8 / max(self.transform().m11(), 1e-3)
+                for i, (wx, wy) in enumerate(pts):
+                    if abs(x - wx) <= tol and abs(y - wy) <= tol:
+                        del pts[i]
+                        self._draw_waypoints(self.active_vehicle)
+                        break
+            if self.mode == "waypoints" and self.active_vehicle:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.unsetCursor()
         self.dragging_wp = None
         super().mouseReleaseEvent(ev)
+
+    def keyPressEvent(self, ev):
+        # U3: Esc finishes waypoint editing
+        if ev.key() == Qt.Key.Key_Escape and self.mode == "waypoints" and self.active_vehicle:
+            viewer = self._find_viewer()
+            if viewer is not None and hasattr(viewer, "_clear_edit_selection"):
+                viewer._clear_edit_selection()
+                self.mode = "manual"
+                if hasattr(viewer, "log_info"):
+                    viewer.log_info("Waypoint editing finished (Esc).")
+                if hasattr(viewer, "update_status_panel"):
+                    viewer.update_status_panel()
+            self.unsetCursor()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
 
     def _find_viewer(self):
         if self._viewer_cache is not None:
@@ -321,7 +415,7 @@ class LaneMapViewer(QWidget):
     # ===================== state =====================
 
     def _init_state(self):
-        self._project = {k: None for k in ("mask", "layout", "homography", "xodr", "openlabel")}
+        self._project = {k: None for k in ("mask", "layout", "homography", "xodr", "openlabel", "db")}
         self._mask_path = self._layout_path = self._homog_path = self._xodr_path = self._openlabel_path = None
         self.homography = None
         self.road = None
@@ -364,6 +458,11 @@ class LaneMapViewer(QWidget):
         self.semantic_db = None
         self._loaded_db_path = None
         self.scenario_gui = None
+        self._save_debug_contexts = False   # U7: debug file writes are opt-in
+        self.wp_line = {"V1": None, "V2": None}   # U3: live preview polyline per vehicle
+        self._db_path = None          # event-sequence DB associated with the project
+        self._project_path = None     # .trace file this session was opened/saved as
+   
 
     @property
     def is_manual_mode(self):
@@ -391,14 +490,28 @@ class LaneMapViewer(QWidget):
     def _build_top_toolbar(self):
         row = QHBoxLayout()
         self.btn_new_proj = QPushButton("New")
+        self.btn_new_proj.setToolTip("Start a new project (asks for mask/layout/homography/xODR/OpenLABEL)")
         self.btn_open_proj = QPushButton("Open")
+        self.btn_open_proj.setToolTip("Open a saved project (.trace) - paths + manual waypoints + DB")
         self.btn_save_proj = QPushButton("Save")
+        self.btn_save_proj.setToolTip("Save current project (file paths + manual waypoints + DB) to .trace")
         self.btn_load_mask = QPushButton("Mask")
+        self.btn_load_mask.setToolTip("Load region mask image (.png/.tif/.npy, 0 = non-drivable)")
         self.btn_load_meta = QPushButton("Layout")
-        self.btn_load_homog = QPushButton("H")
+        self.btn_load_meta.setToolTip("Load layout JSON (regions, topology, centerlines)")
+        self.btn_load_homog = QPushButton("Homo.")
+        self.btn_load_homog.setToolTip("Load homography JSON (pixel <-> world transform)")
         self.btn_load_xodr = QPushButton("xODR")
+        self.btn_load_xodr.setToolTip("Load OpenDRIVE file (referenced by the exported OpenSCENARIO)")
+        self.btn_load_openlabel = QPushButton("OpenLABEL")
+        self.btn_load_openlabel.setToolTip("Load an OpenLABEL JSON with tracked objects (needed for JSON mode + DB build)")
+        self.btn_load_openlabel.clicked.connect(self.load_openlabel_dialog)
+        self.btn_fit_view = QPushButton("Fit")
+        self.btn_fit_view.setToolTip("Zoom to fit the whole mask")
+        self.btn_fit_view.clicked.connect(self._fit_view)
         self.mode_box = QComboBox()
-        self.mode_box.addItems(["Manual", "JSON"])
+        self.mode_box.addItems(["Manual", "OpenLABEL (JSON)"])
+        self.mode_box.setToolTip("Scenario source: manual waypoints or OpenLABEL tracked objects")
         self.mode_box.currentTextChanged.connect(self._on_mode_changed)
 
         self.btn_new_proj.clicked.connect(self.new_project)
@@ -406,17 +519,29 @@ class LaneMapViewer(QWidget):
         self.btn_save_proj.clicked.connect(self.save_project)
         self.btn_load_mask.clicked.connect(self.load_mask)
         self.btn_load_meta.clicked.connect(
-            lambda: self.load_meta_from_path(self._load_with_dialog("Layout", "JSON (*.json")))
+            lambda: self.load_meta_from_path(self._load_with_dialog("Layout", "JSON (*.json)")))
         self.btn_load_homog.clicked.connect(self.load_homography_json)
         self.btn_load_xodr.clicked.connect(self.load_xodr)
 
         for b in (self.btn_new_proj, self.btn_open_proj, self.btn_save_proj,
-                  self.btn_load_mask, self.btn_load_meta, self.btn_load_homog, self.btn_load_xodr):
+                  self.btn_load_mask, self.btn_load_meta, self.btn_load_homog,
+                  self.btn_load_xodr, self.btn_load_openlabel, self.btn_fit_view):
             row.addWidget(b)
         row.addWidget(QLabel("Mode:"))
         row.addWidget(self.mode_box)
         row.addStretch()
         return row
+
+    def load_openlabel_dialog(self):
+        path = self._load_with_dialog("Open OpenLABEL JSON", "JSON Files (*.json)")
+        if path:
+            self.load_openlabel_from_path(path)
+
+
+    def _fit_view(self):
+        if self.view.pixmap_item is not None:
+            self.view.fitInView(self.view.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+
 
     def _build_main_layout(self):
         root = QVBoxLayout(self)
@@ -432,7 +557,7 @@ class LaneMapViewer(QWidget):
         splitter.addWidget(self.bottom_widget)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 2)
-        QTimer.singleShot(0, lambda: splitter.setSizes([900, 200]))
+        QTimer.singleShot(0, lambda: splitter.setSizes([560, 340]))   # U16: was [900, 200]
         root.addWidget(splitter)
         return root
 
@@ -443,7 +568,9 @@ class LaneMapViewer(QWidget):
         # Vehicle row
         veh_row = QHBoxLayout()
         self.ctrl_v1_btn = QPushButton("✏️")
+        self.ctrl_v1_btn.setToolTip("Edit V1 waypoints: click on the map, drag to move, right-click a dot to delete, Esc to finish")
         self.ctrl_v2_btn = QPushButton("✏️")
+        self.ctrl_v2_btn.setToolTip("Edit V2 waypoints: click on the map, drag to move, right-click a dot to delete, Esc to finish")
         self.ctrl_v1_box = self.v1_id_box
         self.ctrl_v2_box = self.v2_id_box
         self.ctrl_v1_btn.clicked.connect(lambda: self._set_wp_mode("V1"))
@@ -464,6 +591,8 @@ class LaneMapViewer(QWidget):
         self.ctrl_end = self.global_end_box
         self.ctrl_duration = self.wp_duration
         self.ctrl_fps = self.wp_fps
+        self.ctrl_duration.setToolTip("Manual mode: trajectory duration in seconds (uniform arc-length resampling). Disabled in JSON mode - duration comes from the frame range.")
+        self.ctrl_fps.setToolTip("Frames per second: manual resampling rate (Manual) / OpenLABEL simulation rate (JSON)")
         time_row.addWidget(QLabel("Start"))
         time_row.addWidget(self.ctrl_start)
         time_row.addWidget(QLabel("End"))
@@ -476,26 +605,34 @@ class LaneMapViewer(QWidget):
         time_row.addStretch()
         layout.addLayout(time_row)
 
-        # Actions row
+        # Actions row (U19: Load DB before Find Similar - workflow order)
         act_row = QHBoxLayout()
         self.ctrl_generate = QPushButton("Generate")
+        self.ctrl_generate.setToolTip("Resample both waypoint sets into frame trajectories (Manual mode)")
         self.ctrl_apply = QPushButton("Apply")
+        self.ctrl_apply.setToolTip("Build the scenario context from the current trajectories")
         self.ctrl_clear = QPushButton("Clear")
+        self.ctrl_clear.setToolTip("Clear the current mode's trajectories (and waypoints in Manual mode)")
         self.ctrl_build_timeline = QPushButton("Build/Refresh DB Index")
-        self.ctrl_find_similar = QPushButton("Find Similar")
+        self.ctrl_build_timeline.setToolTip("Index the loaded OpenLABEL file into an event-sequence database (vehicle + pair tracks)")
         self.ctrl_load_db = QPushButton("Load Semantic DB")
+        self.ctrl_load_db.setToolTip("Load a previously built event-sequence database")
+        self.ctrl_find_similar = QPushButton("Find Similar")
+        self.ctrl_find_similar.setToolTip("Find similar scenarios in the loaded DB (needs a generated base scenario; otherwise lists candidate windows)")
         act_row.addWidget(self.ctrl_generate)
         act_row.addWidget(self.ctrl_apply)
         act_row.addWidget(self.ctrl_clear)
         act_row.addWidget(self.ctrl_build_timeline)
         act_row.addSpacing(20)
+        act_row.addWidget(self.ctrl_load_db)
         act_row.addWidget(self.ctrl_find_similar)
         act_row.addStretch()
         layout.addLayout(act_row)
 
         layout.addWidget(QLabel("Similarity Matches"))
         self.similar_list = QListWidget()
-        self.similar_list.setMinimumHeight(220)
+        self.similar_list.setMinimumHeight(120)      # U16: was 220 (broke the 200 px panel)
+        self.similar_list.setToolTip("Click a match to preview its trajectories on the map (yellow = A, magenta = B)")
         self.similar_list.itemSelectionChanged.connect(self._on_similarity_selected)
         layout.addWidget(self.similar_list)
 
@@ -504,6 +641,9 @@ class LaneMapViewer(QWidget):
         self.similarity_status = QLabel("No similarity search executed")
         status_row.addWidget(self.similarity_status)
         status_row.addStretch()
+        self.chk_save_debug = QCheckBox("Save debug contexts")     # U7
+        self.chk_save_debug.setToolTip("Write every engine context to debug_contexts/ (off by default)")
+        status_row.addWidget(self.chk_save_debug)
         layout.addLayout(status_row)
 
         self.ctrl_generate.clicked.connect(self._on_generate_clicked)
@@ -512,7 +652,13 @@ class LaneMapViewer(QWidget):
         self.ctrl_find_similar.clicked.connect(self.find_similar_scenarios)
         self.ctrl_build_timeline.clicked.connect(self.build_semantic_timeline_database)
         self.ctrl_load_db.clicked.connect(self.load_semantic_database_dialog)
+        self.chk_save_debug.stateChanged.connect(
+            lambda state: setattr(self, "_save_debug_contexts", bool(state)))
+        self.v1_id_box.currentTextChanged.connect(self._refresh_action_states)
+        self.v2_id_box.currentTextChanged.connect(self._refresh_action_states)
+        self._refresh_action_states()
         return panel
+
 
     def _build_info_panel(self):
         row = QHBoxLayout()
@@ -522,11 +668,24 @@ class LaneMapViewer(QWidget):
         self.info_label.setWordWrap(True)
         self.info_label.setFixedHeight(80)
         self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)          # U8: the log was editable
         self.log_view.setFixedHeight(80)
+        log_col = QVBoxLayout()
+        log_col.setContentsMargins(0, 0, 0, 0)
+        log_row = QHBoxLayout()
+        log_row.setContentsMargins(0, 0, 0, 0)
+        log_row.addWidget(self.log_view, 5)
+        self.btn_clear_log = QPushButton("Clear")   # U8
+        self.btn_clear_log.setFixedWidth(44)
+        self.btn_clear_log.setToolTip("Clear the log")
+        self.btn_clear_log.clicked.connect(self.log_view.clear)
+        log_row.addWidget(self.btn_clear_log)
+        log_col.addLayout(log_row)
         row.addWidget(self.status_label, 2)
         row.addWidget(self.info_label, 3)
-        row.addWidget(self.log_view, 2)
+        row.addLayout(log_col, 2)
         self.bottom_layout.addLayout(row)
+
 
     # ===================== mode / editing =====================
 
@@ -544,11 +703,11 @@ class LaneMapViewer(QWidget):
         self.ctrl_v2_box.setVisible(not is_manual)
         self.ctrl_start.setEnabled(not is_manual)
         self.ctrl_end.setEnabled(not is_manual)
-        self.ctrl_generate.setEnabled(is_manual)
-        self.ctrl_clear.setVisible(is_manual)
+        self._refresh_action_states()              # U12: per-mode enable/visibility
         self._hide_all_trajectories()
         self._show_active_mode_trajectories()
         self._update_waypoint_visibility()
+        self.clear_similarity_preview()            # U13: no stale previews across modes
         self.update_status_panel()
         self.log_info(f"Mode changed: {previous_mode.upper()} -> {self.active_mode.upper()}")
         self._emit_active_context()
@@ -556,8 +715,11 @@ class LaneMapViewer(QWidget):
     def _clear_edit_selection(self):
         self.current_wp_vehicle = None
         self.view.active_vehicle = None
+        self.view.dragging_wp = None
+        self.view.unsetCursor()                    # U3: restore cursor when editing ends
         self.ctrl_v1_btn.setStyleSheet("")
         self.ctrl_v2_btn.setStyleSheet("")
+
 
     def _set_wp_mode(self, vehicle):
         if not self.is_manual_mode:
@@ -582,9 +744,12 @@ class LaneMapViewer(QWidget):
         for v in ("V1", "V2"):
             for item in self.view.wp_items[v]:
                 item.setVisible(self.is_manual_mode)
+            if self.wp_line.get(v) is not None:      # U3
+                self.wp_line[v].setVisible(self.is_manual_mode)
 
     def _on_clear_clicked(self):
         self._invalidate_active_scenario("clear_clicked")
+        self.clear_similarity_preview()            # U13
         if self.is_manual_mode:
             self._clear_all_waypoints()
             self._manual_traj_done = {"V1": False, "V2": False}
@@ -597,7 +762,9 @@ class LaneMapViewer(QWidget):
             self._world_polylines_json = {"V1": None, "V2": None}
         self._emit_active_context()
         self.update_status_panel()
+        self._refresh_action_states()              # U12
         self.log_info("Cleared current mode data.")
+
 
     # ===================== generate / apply =====================
 
@@ -615,12 +782,20 @@ class LaneMapViewer(QWidget):
             self.apply_loaded_trajectories()
         ctx = self._map_context_manual if self.is_manual_mode else self._map_context_json
         actors = ctx.get("actors", {})
-        print("CTX READY:", ctx.get("ready"))
-        print("A timeline size:", len(actors.get("A", {}).get("timeline", {})))
-        print("B timeline size:", len(actors.get("B", {}).get("timeline", {})))
-        print("Interaction timeline size:", len(ctx.get("interaction_facts", {}).get("timeline", {})))
+        # U9: the Apply result used to go to print() only - now it is visible
+        self.log_info(
+            f"Context ready={ctx.get('ready')} | "
+            f"V1: {len(actors.get('A', {}).get('timeline', {}))} frames | "
+            f"V2: {len(actors.get('B', {}).get('timeline', {}))} frames | "
+            f"pair: {len(ctx.get('interaction_facts', {}).get('timeline', {}))} frames"
+            + (f" | error: {ctx.get('error')}" if ctx.get("error") else "")
+        )
+
 
     def apply_manual_trajectory(self):
+        if self._manual_dirty:
+            # U2: stale trajectories + new duration = silently wrong speeds/times
+            return self.log_warn("Timing changed - press Generate first (stale trajectories would be applied).")
         for v in ("V1", "V2"):
             if len(self._traj_map_manual.get(v, [])) < 2:
                 return self.log_warn(f"{v} trajectory too short.")
@@ -630,6 +805,7 @@ class LaneMapViewer(QWidget):
         self._engine_context = None
         self.emit_all_vehicle_map_contexts()
         self.log_info("Manual trajectories applied")
+
 
     def _generate_wp_trajectory(self):
         v = self.current_wp_vehicle
@@ -662,6 +838,8 @@ class LaneMapViewer(QWidget):
         self.log_info(f"{v} trajectory generated ({len(px_pts)} frames)")
         self.update_status_panel()
         self.polyline_committed.emit(v, json.dumps({"px": px_pts, "world": world_pts}))
+        self._refresh_action_states()              # U12
+
 
     def _resample_waypoints_time_based(self, pts_px, duration_s, fps):
         """Waypoint polyline -> [(frame, x_px, y_px), ...], uniform in arc length."""
@@ -680,12 +858,22 @@ class LaneMapViewer(QWidget):
         return [(i, float(xs[i]), float(ys[i])) for i in range(total_frames)]
 
     def _on_manual_timing_changed(self):
-        if not self.is_manual_mode or not any(self._manual_traj_done.values()):
-            return
-        self._manual_dirty = True
-        self._invalidate_active_scenario("manual_timing_changed")
-        self.log_warn("Manual timing changed. Press Generate to rebuild trajectories.")
+        if self.is_manual_mode:
+            if not any(self._manual_traj_done.values()):
+                return
+            self._manual_dirty = True
+            self._invalidate_active_scenario("manual_timing_changed")
+            self.log_warn("Manual timing changed. Press Generate to rebuild trajectories.")
+        else:
+            # U4: FPS used to take effect only when the frame range changed again
+            self.fps = float(self.wp_fps.value())
+            if self._traj_map_json:
+                self._json_dirty = True
+                self._invalidate_active_scenario("json_fps_changed")
+                self.log_warn("FPS changed. Press Apply to reload trajectories.")
+            self.compute_and_emit_duration()
         self.update_status_panel()
+
 
     def _on_json_frame_range_changed(self):
         if self.active_mode != "json":
@@ -812,8 +1000,14 @@ class LaneMapViewer(QWidget):
             if self.view.mask is not None:
                 self.mask_loaded.emit(self.view.mask)
             self._try_init_road()
+            # U5: centerlines were only drawn when the layout loaded; if the mask
+            # loads AFTER the layout they now appear as well.
+            if self.road is not None:
+                self.view.draw_centerlines(self.road)
+            self._refresh_action_states()            # U12
         except Exception as e:
             self.log_warn(f"Failed to load mask: {e}")
+
 
     def load_meta_from_path(self, path: str):
         try:
@@ -833,6 +1027,7 @@ class LaneMapViewer(QWidget):
             self.log_warn(f"RoadInfrastructure failed: {e}")
             if not self.road or not self.road.regions:
                 self.log_warn("RoadInfrastructure has no regions")
+                self._refresh_action_states()        # U12
                 return
         self._layout_path = path
         self._project["layout"] = path
@@ -840,6 +1035,8 @@ class LaneMapViewer(QWidget):
             self.meta_loaded.emit(meta)
         self._attach_homography_to_road()
         self._rebuild_context_builder()
+        self._refresh_action_states()                # U12
+
 
     def load_homography_from_path(self, path: str):
         try:
@@ -862,8 +1059,11 @@ class LaneMapViewer(QWidget):
         except Exception as e:
             self.homography = None
             self.log_warn(f"Failed to load homography: {e}")
+            self._refresh_action_states()            # U12
             return
         self._attach_homography_to_road()
+        self._refresh_action_states()                # U12
+
 
     def load_xodr_from_path(self, path: str):
         self._xodr_path = path
@@ -900,12 +1100,47 @@ class LaneMapViewer(QWidget):
             box.blockSignals(False)
         self.update_vehicle_ids_for_duration()
         QTimer.singleShot(0, self.update_vehicle_ids_for_duration)
+        self._refresh_action_states()                # U12
 
-    # Project (re)load via dialogs
+
     def new_project(self):
+        # U12: confirm before destroying work
+        has_work = (
+            any(self.view.manual_waypoints.values())
+            or bool(self._traj_map_manual)
+            or bool(self._traj_map_json)
+        )
+        if has_work:
+            ret = QMessageBox.question(
+                self, "New Project",
+                "Start a new project? Current waypoints, trajectories and context will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
         self._invalidate_active_scenario("new_project")
         self._project = {k: None for k in self._project}
         self._mask_path = self._layout_path = self._homog_path = self._xodr_path = self._openlabel_path = None
+        self._db_path = None
+        self._project_path = None
+        # U12/U21: full state reset (previously the canvas kept old waypoints/trajectories)
+        self.view.clear_waypoints()
+        self._manual_traj_done = {"V1": False, "V2": False}
+        self._traj_map_manual.clear()
+        self._traj_map_json.clear()
+        self._vehicle_context_cache.clear()
+        self._world_polylines_manual = {"V1": None, "V2": None}
+        self._world_polylines_json = {"V1": None, "V2": None}
+        for mode_items in self._traj_items.values():
+            for v in ("V1", "V2"):
+                self.clear_traj_items(mode_items.get(v, []))
+                mode_items[v] = []
+        self._map_context_manual = {"ready": False}
+        self._map_context_json = {"ready": False}
+        self._engine_context = None
+        self.clear_similarity_preview()
+        self._refresh_action_states()
         self.log_info("New Project: Browse files for your project (you can skip any).")
         mask = self._load_with_dialog("Select Mask", "Mask Files (*.png *.tif *.tiff *.npy)")
         if mask:
@@ -928,6 +1163,7 @@ class LaneMapViewer(QWidget):
             self.save_project()
         self.update_status_panel()
 
+
     def open_project(self):
         self._invalidate_active_scenario("open_project")
         path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "Project (*.trace)")
@@ -939,7 +1175,15 @@ class LaneMapViewer(QWidget):
         except Exception as e:
             self.log_warn(f"Failed to read project: {e}")
             return
-        self._project = {k: proj.get(k) for k in ("mask", "layout", "homography", "xodr", "openlabel")}
+        self._project = {k: proj.get(k) for k in ("mask", "layout", "homography", "xodr", "openlabel", "db")}
+        # resolve relative paths against the project file, not the CWD
+        base = os.path.dirname(os.path.abspath(path))
+        for k, p in self._project.items():
+            if p and not os.path.isabs(p):
+                self._project[k] = os.path.join(base, p)
+        self._project_path = path
+        self._db_path = self._project.get("db")
+
         loaders = {
             "mask": self.load_mask_from_path,
             "layout": self.load_meta_from_path,
@@ -947,11 +1191,75 @@ class LaneMapViewer(QWidget):
             "xodr": self.load_xodr_from_path,
             "openlabel": self.load_openlabel_from_path,
         }
+        missing = []
         for key, loader in loaders.items():
-            if self._project.get(key):
-                loader(self._project[key])
-        self.log_info("Project loaded.")
+            p = self._project.get(key)
+            if not p:
+                continue
+            if not os.path.exists(p):
+                missing.append(key)
+                self.log_warn(f"Project file missing: {key} -> {p}")
+                continue
+            loader(p)
+
+        # restore manual waypoints
+        wps = proj.get("waypoints") or {}
+        for v in ("V1", "V2"):
+            try:
+                pts = [(float(x), float(y)) for x, y in (wps.get(v) or [])]
+            except (TypeError, ValueError):
+                pts = []
+            self.view.manual_waypoints[v] = pts
+            if pts:
+                self.view._draw_waypoints(v)
+        if any(wps.values()):
+            self.log_info(f"Restored waypoints: V1={len(wps.get('V1', []))}, "
+                          f"V2={len(wps.get('V2', []))} - press Generate to rebuild trajectories")
+
+        # auto-load the project's event-sequence DB (no rebuild needed)
+        if self._db_path:
+            if os.path.exists(self._db_path):
+                try:
+                    self.load_semantic_database(self._db_path)
+                except Exception as e:
+                    self.log_warn(f"Project DB could not be loaded: {e}")
+            else:
+                self.log_warn(f"Project DB file missing: {self._db_path} - build the index again")
+
+        if missing:
+            QMessageBox.warning(
+                self, "Project",
+                f"Project loaded with missing files: {', '.join(missing)}")
+        else:
+            self.log_info("Project loaded.")
+        self._refresh_action_states()
         self.update_status_panel()
+
+
+    def _sync_project_file(self):
+        """Rewrite the .trace file (paths + waypoints + DB) when one is known,
+        so the next Open Project restores the index without rebuilding."""
+        if not self._project_path or not os.path.exists(self._project_path):
+            return
+        proj = {
+            "mask": self._mask_path,
+            "layout": self._layout_path,
+            "homography": self._homog_path,
+            "xodr": self._xodr_path,
+            "openlabel": self._openlabel_path,
+            "db": self._db_path,
+            "waypoints": {
+                v: [[float(x), float(y)] for x, y in self.view.manual_waypoints[v]]
+                for v in ("V1", "V2")
+            },
+        }
+        try:
+            with open(self._project_path, "w", encoding="utf-8") as f:
+                json.dump(proj, f, ensure_ascii=False, indent=2)
+            self.log_info(f"Project updated: {self._project_path}")
+        except Exception as e:
+            self.log_warn(f"Could not update project file: {e}")
+
 
     def save_project(self):
         proj = {
@@ -960,6 +1268,11 @@ class LaneMapViewer(QWidget):
             "homography": self._homog_path,
             "xodr": self._xodr_path,
             "openlabel": self._openlabel_path,
+            "db": self._db_path,
+            "waypoints": {
+                v: [[float(x), float(y)] for x, y in self.view.manual_waypoints[v]]
+                for v in ("V1", "V2")
+            },
         }
         path, _ = QFileDialog.getSaveFileName(self, "Save Project", "project.trace", "Project (*.trace)")
         if not path:
@@ -969,9 +1282,12 @@ class LaneMapViewer(QWidget):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(proj, f, ensure_ascii=False, indent=2)
+            self._project_path = path
             self.log_info(f"Project saved to {path}")
         except Exception:
             self.log_warn("Failed to save project.")
+
+
 
     def load_mask(self):
         path = self._load_with_dialog("Open Mask", "Mask Files (*.png *.tif *.tiff *.npy)")
@@ -1646,32 +1962,42 @@ class LaneMapViewer(QWidget):
 
     def emit_all_vehicle_map_contexts(self):
         if not self._get_active_traj_map():
-            print("[LaneMapViewer] No active trajectories.")
+            self.log_warn("No active trajectories.")
             return
         if not (self.road and self.view.meta and self.homography):
-            print("[LaneMapViewer] Missing required map components.")
+            self.log_warn("Missing required map components (mask/layout/homography).")
             return
-        print(f"[LaneMapViewer] Emitting contexts mode={self.active_mode}")
-        ctx = self._build_normalize_validate_emit()
+        self.log_info(f"Building map context (mode={self.active_mode}) ...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # U10
+        try:
+            ctx = self._build_normalize_validate_emit()
+        finally:
+            QApplication.restoreOverrideCursor()
         self._engine_context = None
         self.map_context_ready.emit(ctx)
-        print(f"[LaneMapViewer] Emitted {'VALID' if ctx.get('ready') else 'INVALID'} context")
+        self.log_info(
+            f"Emitted {'VALID' if ctx.get('ready') else 'INVALID'} context"
+            + (f" ({ctx.get('error')})" if ctx.get("error") else ""))
+
 
     def _emit_active_context(self):
         ctx = self._map_context_manual if self.is_manual_mode else self._map_context_json
         if not ctx or not ctx.get("ready"):
-            print("[Context] Skipped emit (not ready)")
+            self.log_info("Context emit skipped (not ready)")
             return
         self.map_context_ready.emit(ctx)
-        print("[Context] emitted")
+        self.log_info("Active context re-emitted")
+
 
     def receive_engine_context(self, ctx: dict):
         if not isinstance(ctx, dict) or ctx.get("kind") != "engine_context":
-            print("[LaneMapViewer] Ignored invalid engine context")
+            self.log_warn("Ignored invalid engine context")
             return
         self._engine_context = dict(ctx)
-        print("[LaneMapViewer] Engine context received")
-        self._debug_save_context(ctx, tag="engine_enriched")
+        self.log_info("Engine context received")
+        if getattr(self, "_save_debug_contexts", False):   # U7: opt-in only
+            self._debug_save_context(ctx, tag="engine_enriched")
+
 
     def _invalidate_active_scenario(self, reason=""):
         """Active scenario changed; engine-derived products are now invalid."""
@@ -1755,48 +2081,56 @@ class LaneMapViewer(QWidget):
             return self.log_warn("Invalid frame selection.")
         self._map_context_json = self._empty_context()
         self._engine_context = None
+        self.clear_similarity_preview()          # U13
         if fstart > fend:
             fstart, fend = fend, fstart
         v1_id, v2_id = self.v1_id_box.currentText(), self.v2_id_box.currentText()
         if not v1_id or not v2_id or v1_id == v2_id:
             return self.log_warn("Select two different vehicles.")
 
-        px1 = [(fr, x, y) for fr, x, y in self.openlabel_traj_map[v1_id] if fstart <= fr <= fend]
-        px2 = [(fr, x, y) for fr, x, y in self.openlabel_traj_map[v2_id] if fstart <= fr <= fend]
-        if len(px1) < 2 or len(px2) < 2:
-            return self.log_warn("Too few trajectory points.")
-        w1, w2 = self.px_to_world_polyline(px1), self.px_to_world_polyline(px2)
-        if not w1 or not w2:
-            return self.log_warn("World conversion failed (check homography + mask coverage).")
-
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # U10
         try:
-            traj1_dict = {fr: (x, y) for fr, x, y in self.openlabel_traj_map[v1_id]}
-            traj2_dict = {fr: (x, y) for fr, x, y in self.openlabel_traj_map[v2_id]}
-            traj_v1, traj_v2 = [], []
-            for fr in range(fstart, fend + 1):
-                if fr in traj1_dict and fr in traj2_dict:
-                    traj_v1.append((fr, *traj1_dict[fr]))
-                    traj_v2.append((fr, *traj2_dict[fr]))
+            px1 = [(fr, x, y) for fr, x, y in self.openlabel_traj_map[v1_id] if fstart <= fr <= fend]
+            px2 = [(fr, x, y) for fr, x, y in self.openlabel_traj_map[v2_id] if fstart <= fr <= fend]
+            if len(px1) < 2 or len(px2) < 2:
+                return self.log_warn("Too few trajectory points.")
+            w1, w2 = self.px_to_world_polyline(px1), self.px_to_world_polyline(px2)
+            if not w1 or not w2:
+                return self.log_warn("World conversion failed (check homography + mask coverage).")
 
-            store = self._get_active_store()
-            store["traj_map"].update({"V1": traj_v1, "V2": traj_v2})
-            store["world"].update({"V1": w1, "V2": w2})
-            self._rebuild_vehicle_context_cache()
+            try:
+                traj1_dict = {fr: (x, y) for fr, x, y in self.openlabel_traj_map[v1_id]}
+                traj2_dict = {fr: (x, y) for fr, x, y in self.openlabel_traj_map[v2_id]}
+                traj_v1, traj_v2 = [], []
+                for fr in range(fstart, fend + 1):
+                    if fr in traj1_dict and fr in traj2_dict:
+                        traj_v1.append((fr, *traj1_dict[fr]))
+                        traj_v2.append((fr, *traj2_dict[fr]))
 
-            for v, pts, color in (("V1", px1, QColor("green")), ("V2", px2, QColor("cyan"))):
-                pts_xy = [(x, y) for _, x, y in pts]
-                self.clear_traj_items(store["items"].get(v, []))
-                store["items"][v] = self.view.draw_trajectory(pts_xy, color)
+                store = self._get_active_store()
+                store["traj_map"].update({"V1": traj_v1, "V2": traj_v2})
+                store["world"].update({"V1": w1, "V2": w2})
+                self._rebuild_vehicle_context_cache()
 
-            if self.scenario_gui and hasattr(self.scenario_gui, "reset_vehicle_contexts"):
-                self.scenario_gui.reset_vehicle_contexts()
-            self._json_dirty = False
-            self.compute_and_emit_duration()
-            self._rebuild_hover_index()
-            self.emit_all_vehicle_map_contexts()
-            self.log_info(f"Applied trajectories: V1={v1_id}, V2={v2_id}")
-        except Exception as e:
-            self.log_error(f"Apply failed: {e}")
+                for v, pts, color in (("V1", px1, QColor("green")), ("V2", px2, QColor("cyan"))):
+                    pts_xy = [(x, y) for _, x, y in pts]
+                    self.clear_traj_items(store["items"].get(v, []))
+                    store["items"][v] = self.view.draw_trajectory(pts_xy, color)
+
+                if self.scenario_gui and hasattr(self.scenario_gui, "reset_vehicle_contexts"):
+                    self.scenario_gui.reset_vehicle_contexts()
+                self._json_dirty = False
+                self.compute_and_emit_duration()
+                self._rebuild_hover_index()
+                self.emit_all_vehicle_map_contexts()
+                self.log_info(f"Applied trajectories: V1={v1_id}, V2={v2_id} "
+                              f"({len(traj_v1)} common frames, {fstart}-{fend})")   # U11
+            except Exception as e:
+                self.log_error(f"Apply failed: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._refresh_action_states()         # U12
+
 
     # ===================== status / hover info =====================
 
@@ -1812,9 +2146,45 @@ class LaneMapViewer(QWidget):
     def _append_log(self, level: str, text: str):
         if not hasattr(self, "log_view"):
             return
-        self.log_view.append(f"[{level}] {text}")
         sb = self.log_view.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        at_bottom = sb.value() >= sb.maximum() - 4       # U8: don't yank the scroll position
+        color = {"WARN": "#b9770e", "ERROR": "#c0392b"}.get(level, "#2c3e50")
+        self.log_view.append(
+            f'<span style="color:#7f8c8d">{time.strftime("%H:%M:%S")}</span> '
+            f'<span style="color:{color};font-weight:bold">[{level}]</span> {text}'
+        )
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def _refresh_action_states(self):
+        """State-based button enabling - preconditions visible without clicking.
+
+        JSON mode: Apply is NOT gated on _traj_map_json - that store is only
+        filled BY Apply itself (chicken-and-egg). Its real preconditions are
+        OpenLABEL loaded + map components + two distinct vehicles.
+        """
+        is_manual = self.is_manual_mode
+        has_map = bool(self.road and self.view.meta is not None and self.homography)
+        has_traj = bool(self._get_active_traj_map())
+        self.ctrl_generate.setVisible(is_manual)
+        self.ctrl_generate.setEnabled(is_manual and has_map)
+        if is_manual:
+            self.ctrl_apply.setEnabled(has_traj)
+        else:
+            v1 = self.v1_id_box.currentText()
+            v2 = self.v2_id_box.currentText()
+            self.ctrl_apply.setEnabled(
+                bool(self.openlabel_traj_map) and has_map
+                and bool(v1) and bool(v2) and v1 != v2)
+        self.ctrl_clear.setVisible(True)
+        self.ctrl_duration.setEnabled(is_manual)
+        self.ctrl_build_timeline.setEnabled(
+            (not is_manual) and bool(self.openlabel_traj_map) and has_map)
+        self.ctrl_find_similar.setEnabled(
+            self.semantic_db is not None or bool(self._precomp.get("pair_windows", [])))
+        self.json_status.setVisible(not is_manual)
+
+
 
     def update_status_panel(self):
         if self.is_manual_mode:
@@ -1978,7 +2348,8 @@ class LaneMapViewer(QWidget):
         if not query_sequence:
             wins = self._precomp.get("pair_windows", [])
             if not wins:
-                return self.log_info("No candidate windows in index. Try Precompute again.")
+                self.similarity_status.setText("No candidate windows in index")   # U6
+                return self.log_info("No candidate windows in index. Build the DB first.")
 
             def wscore(w):
                 s_lane = w.get("shared_lane_fraction", 0.0)
@@ -1995,6 +2366,7 @@ class LaneMapViewer(QWidget):
                              f"min_dist={w['min_dist']:.1f}, min_ttc={ttc_s}, "
                              f"same_lane={w['shared_lane_fraction']:.2f}")
             msg = "Candidate (v1, v2, [start,end]) windows from index:\n\n" + "\n".join(lines)
+            self.similarity_status.setText(f"{len(top)} candidate windows (no base scenario)")  # U6
             self.log_info("Suggested Candidate Windows" + msg)
             return
 
@@ -2012,6 +2384,7 @@ class LaneMapViewer(QWidget):
             except Exception:
                 db = None
         if db is None:
+            self.similarity_status.setText("No semantic DB loaded")   # U6
             return self.log_warn("Build an Event Timeline first.")
 
         tracks = db.get("tracks", [])
@@ -2054,7 +2427,15 @@ class LaneMapViewer(QWidget):
         results = sorted(unique.values(), key=lambda x: x["score"], reverse=True)
         self._last_similarity_results = results[:50]
         self._populate_similarity_list()
-        self.log_info(f"{len(self._last_similarity_results)} candidate matches found.")
+        if self._last_similarity_results:
+            self.similarity_status.setText(
+                f"{len(self._last_similarity_results)} matches "
+                f"(top score {self._last_similarity_results[0]['score']:.3f})")   # U6
+            self.log_info(f"{len(self._last_similarity_results)} candidate matches found.")
+        else:
+            self.similarity_status.setText("No matches (score < 0.15)")           # U6
+            self.log_info("No candidate matches found (all scores < 0.15).")
+
 
     def _topology_score(self, track):
         try:
@@ -2163,30 +2544,32 @@ class LaneMapViewer(QWidget):
         tracks = self.semantic_db.get("tracks", [])
         event_index, transition_index = {}, {}
         for idx, track in enumerate(tracks):
-            raw, tokens = [], []
-            for e in track.get("event_sequence", []):
-                if not isinstance(e, dict):
-                    continue
-                raw.append(e.get("event", "?"))
-                tokens.append(e.get("event_token") or f"none:{e.get('event', '?')}")
-            for ev in set(raw):
+            events = [e.get("event", "?") for e in track.get("event_sequence", [])
+                      if isinstance(e, dict)]
+            for ev in set(events):
                 event_index.setdefault(ev, []).append(idx)
-            # Token bigrams - what _candidate_track_indices queries.
-            for a, b in zip(tokens[:-1], tokens[1:]):
-                transition_index.setdefault(f"{a}>{b}", []).append(idx)
-            # Raw-name bigrams - kept so pre-fix query conventions still hit.
-            for a, b in zip(raw[:-1], raw[1:]):
+            for a, b in zip(events[:-1], events[1:]):
                 transition_index.setdefault(f"{a}>{b}", []).append(idx)
         self.semantic_db["_event_index"] = event_index
         self.semantic_db["_transition_index"] = transition_index
         self._loaded_db_path = path
+        self._db_path = path
+        self._project["db"] = path
+        self._sync_project_file()
+        self.similarity_status.setText(f"DB: {len(tracks)} tracks")
         self.log_info(f"Loaded event database ({len(tracks)} tracks)")
+        self._refresh_action_states()
+                         # U12
 
 
     def load_semantic_database_dialog(self):
         path = self._load_with_dialog("Load Event Sequence DB", "JSON (*.json)")
         if path:
-            self.load_semantic_database(path)
+            try:
+                self.load_semantic_database(path)
+            except Exception as e:   # U11: a corrupt file used to surface as
+                self.log_error(f"Failed to load event database: {e}")     # "Build an Event Timeline first."
+
 
     def build_semantic_timeline_database(self):
         if not self.openlabel_traj_map:
@@ -2196,10 +2579,31 @@ class LaneMapViewer(QWidget):
         if not self.homography:
             return self.log_warn("Load homography first.")
 
+        # default to the DB the project already uses, so re-building overwrites it
+        default_name = (os.path.basename(self._db_path)
+                        if self._db_path and os.path.exists(self._db_path)
+                        else "event_sequence_db.json")
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Event Sequence Database", "event_sequence_db.json", "JSON (*.json)")
+            self, "Save Event Sequence Database", default_name, "JSON (*.json)")
         if not save_path:
             return
+        active_dialog = None
+
+        def _abort(reason):
+            """U10: close progress, remove the partial file, say why."""
+            nonlocal active_dialog
+            if active_dialog is not None:
+                try:
+                    active_dialog.close()
+                except Exception:
+                    pass
+                active_dialog = None
+            try:
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+            except OSError:
+                pass
+            self.log_warn(f"Database build aborted ({reason}) - partial file removed.")
 
         try:
             ids = sorted(self.openlabel_traj_map, key=str)
@@ -2225,11 +2629,13 @@ class LaneMapViewer(QWidget):
             vehicle_ctx_cache = self._openlabel_vehicle_ctx_cache
             progress_ctx = QProgressDialog("Precomputing vehicle semantics...", "Cancel",
                                            0, max(len(ids), 1), self)
+            active_dialog = progress_ctx
             for i, oid in enumerate(ids):
                 if i % 20 == 0:
                     progress_ctx.setValue(i)
                     QApplication.processEvents()
                 if progress_ctx.wasCanceled():
+                    _abort("cancelled")
                     return
                 try:
                     if oid not in vehicle_ctx_cache:
@@ -2252,17 +2658,19 @@ class LaneMapViewer(QWidget):
                 except Exception as e:
                     print(f"[CTX CACHE] {oid}: {e}")
             progress_ctx.close()
+            active_dialog = None
 
             total_pairs = len(ids) * (len(ids) - 1) // 2
             progress = QProgressDialog("Building Event Database...", "Cancel",
                                        0, max(total_pairs, 1), self)
+            active_dialog = progress
             tracks_written, first_track, counter = 0, True, 0
 
             def write_track(track):
                 nonlocal first_track, tracks_written
                 if not first_track:
                     out.write(",\n")
-                json.dump(sanitize_for_json(track), out, ensure_ascii=False, allow_nan=False)
+                json.dump(track, out, ensure_ascii=False)
                 first_track = False
                 tracks_written += 1
                 if tracks_written % 500 == 0:
@@ -2309,8 +2717,6 @@ class LaneMapViewer(QWidget):
                             "route_signatures": [tuple(ctx_single["actors"]["A"]
                                                        ["route_semantics"]["transitions"])],
                             "topology_facts": ctx_single["actors"]["A"]["topology_facts"],
-                            "semantic_signature": descriptor.get("search_index", {})
-                                                   .get("semantic_signature", {}),                            
                         })
                     except Exception as e:
                         print(f"[VEHICLE INDEX] {oid}: {e}")
@@ -2326,6 +2732,7 @@ class LaneMapViewer(QWidget):
                             progress.setValue(counter)
                             QApplication.processEvents()
                         if progress.wasCanceled():
+                            _abort("cancelled")
                             return
                         v2 = vehicle_cache.get(v2_id)
                         if not v2:
@@ -2393,10 +2800,15 @@ class LaneMapViewer(QWidget):
 
                 out.write("\n]}")
             progress.close()
-            self.load_semantic_database(save_path)
+            active_dialog = None
+            self.load_semantic_database(save_path)   # records _db_path + syncs the .trace
+            if not self._project_path:
+                self.log_info("Tip: save the project (.trace) to remember this DB for next time.")
             self.log_info(f"Database saved and loaded.\nTracks: {tracks_written}\nFile: {save_path}")
         except Exception as e:
             self.log_error(f"Database generation failed: {e}")
+            _abort("error")
+
 
     def _pair_spatial_rejection(self, v1, v2, start_frame, end_frame):
         """Cheap prefilter: reject pairs far apart at 3 sampled frames."""
