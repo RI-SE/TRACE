@@ -1,4 +1,4 @@
-# TRACE — Traffic scenario Recognition and Context Extraction
+# TRACE — Lane-Map Scenario Engine
 
 TRACE is a desktop tool (PyQt6) that builds driving-interaction scenarios from a
 lane map plus trajectories, extracts semantic interaction rules with a
@@ -230,6 +230,20 @@ Debug contexts are dumped to `debug_contexts/` when enabled.
 | Similarity preview fails | Candidate vehicles must exist in the currently loaded OpenLABEL file |
 | "Too few trajectory points" | Pick a frame range where both vehicles are tracked |
 
+
 ## License
 
-Add a `LICENSE` file (e.g., MIT) before publishing.
+TRACE is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
+
+## Acknowledgement
+<br><div align="center">
+  <img src="docs/synergies.svg" alt="Synergies logo" width="200"/>
+</div>
+
+This package is developed as part of the [SYNERGIES](https://synergies-ccam.eu/) project.
+
+<br><div align="center">
+  <img src="docs/funded_by_eu.svg" alt="Funded by EU" width="200"/>
+</div>
+
+Funded by the European Union. Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or European Climate, Infrastructure and Environment Executive Agency (CINEA). Neither the European Union nor the granting authority can be held responsible for them.
