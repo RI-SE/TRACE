@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-scenario"
+version = "0.1.0"
+description = "TRACE: lane-map scenario construction, GoRules rule extraction, semantic similarity search and OpenSCENARIO export"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["autonomous-driving", "scenario", "openscenario", "esmini", "opendrive"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python>=4.8",
+    "PyQt6>=6.5",
+    "matplotlib>=3.7",
+    "jsonschema>=4.17",
+]
+
+[project.optional-dependencies]
+lstm = ["torch>=2.0"]
+dev = ["pytest>=7.4", "ruff>=0.4"]
+
+[project.scripts]
+trace = "main_app:main"
+
+[tool.setuptools]
+py-modules = [
+    "main_app",
+    "lane_map_viewer_gui",
+    "scenario_rule_gui",
+    "scenario_engine",
+    "signal_engine",
+    "road_infrastructure",
+    "explanation_generator",
+    "lstm_single_bridge",
+    "OpenScenarioExporter",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["E501"]  # pre-existing long lines; tighten incrementally
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

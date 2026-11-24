@@ -1,999 +1,235 @@
-# TRACE Architecture Specification
+# TRACE — Traffic scenario Recognition and Context Extraction
 
-## Purpose
+TRACE is a desktop tool (PyQt6) that builds driving-interaction scenarios from a
+lane map plus trajectories, extracts semantic interaction rules with a
+JSON-configurable **GoRules** engine, indexes scenarios into a searchable
+**event-sequence database**, finds similar historical scenarios, produces a
+human-readable explanation that mirrors the search key, and exports the result
+as **OpenSCENARIO 1.0** (`.xosc`) for replay in esmini.
 
-TRACE transforms trajectories and road-network topology into:
+## Features
 
-- Map-enriched scenario contexts
-- Semantic traffic events
-- Behavioral inferences
-- Human-readable explanations
-- Semantic scenario databases
-- Similarity-search descriptors
-- OpenSCENARIO scenarios
+- **Two input modes**
+  - *Manual*: click waypoints for V1/V2 on the lane mask; duration + FPS resampling.
+  - *JSON (OpenLABEL)*: pick frame range + two vehicle IDs from tracked objects.
+- **Scenario context construction**: per-vehicle Frenet `s`/`d` (continuous
+  `s_global` across lane changes), pairwise distance / Δs / Δd / TTC timeline,
+  route semantics (`FOLLOW / LANE_CHANGE / DIVERGE / TRANSFER`), topology facts
+  (shared merges/diverges, junctions).
+- **Event detection**: `waiting`, `lane_change` (topology-validated lateral
+  moves), `proximity` (distance-gated episodes).
+- **Rule extraction**: GoRules expression + decision nodes defined in
+  `scenario_gorules.json` (cut-in, merge, yield, near-miss variants, avoidance,
+  overtake, tailgating, car following, waiting-for-gap, complex/connector
+  navigation, …), plus an optional temporal sequence matcher
+  (`sequence_rules`).
+- **Scenario signature + deterministic 128-d embedding**:
+  `S{same_lane}_M{merges}_D{diverges}_J{junction} || routeA | routeB || ONE:waiting -> AB:proximity ...`
+- **Human explanation** (`Explain Rules`): the same semantic sequence the
+  similarity search matches on, plus global metrics, compact event counts,
+  rule timeline (with `only fired` filter) and insights.
+- **Semantic DB + similarity search**: build an event-sequence database from
+  OpenLABEL data (per-vehicle + all vehicle pairs, ≥ 50 common frames, spatial
+  prefilter); score candidates with
+  `0.60 × event + 0.40 × topology` where event = `0.50·LCS + 0.20·Jaccard +
+  0.30·subsequence`; click a result to preview the candidate on the map.
+- **OpenSCENARIO export**: two vehicles with `DefaultDriver` controllers,
+  lane-seed or world-position spawn, speed hold, time-triggered lane changes,
+  stop at scenario end, parameter declarations from insights.
+- **Optional LSTM-VAE latent signatures** (single-vehicle model; see below).
 
-TRACE follows a strict separation between:
+## Architecture
 
-- Infrastructure facts
-- Route semantics
-- Traffic events
-- Behavioral interpretations
-
----
-
-# Core Principle
-
-Infrastructure produces facts.
-
-GoRules produces interpretations.
-
-Python should generate context.
-
-GoRules should generate semantics.
-
----
-
-# Main Data Flow
-
-```text
-OpenLABEL / Trajectories
-            +
-OpenDRIVE
-            +
-Lanelet-Enriched Metadata
-            +
-Homography
-            ↓
-
-RoadInfrastructure
-            ↓
-
-LaneMapViewer
-            ↓
-
-MapScenarioContext
-            ↓
-
-Scenario Engine
-            ↓
-
-GoRules
-            ↓
-
-Events
-Behaviors
-Insights
-
-            ↓
-
-Scenario Descriptor
-
-            ↓
-      ┌─────────────┬───────────────┬───────────────┐
-      ↓             ↓               ↓
-Similarity    Explanations     OpenSCENARIO
-  Search                           Export
+```
+ mask / layout / homography / xODR / OpenLABEL
+                 │
+        LaneMapViewer  (lane_map_viewer_gui.py, LaneCanvas)
+                 │  map_scenario_context {actors A/B, interaction_facts,
+                 │                       interaction_topology, meta}
+                 ▼
+        ScenarioRuleGUI  (scenario_rule_gui.py)
+                 │  suggest_rules_combined()
+                 ▼
+   scenario_engine.py ──── scenario_gorules.json (thresholds + rule DSL)
+   signal_engine.py      (validation, normalization, kinematics, pairwise)
+   road_infrastructure.py (Frenet, region lookup, lane relations)
+                 │
+   ├─ rule table + insights table
+   ├─ explanation_generator.py  (search-key-mirroring text)
+   ├─ semantic DB (build / load / find-similar / preview)
+   ├─ OpenScenarioExporter.py   (.xosc → esmini)
+   └─ lstm_single_bridge.py     (optional latent signatures)
 ```
 
----
+| Module | Responsibility |
+|---|---|
+| `main_app.py` | Window + signal wiring between the two panes |
+| `lane_map_viewer_gui.py` | Canvas, waypoint/JSON trajectories, context building, semantic DB, similarity search |
+| `scenario_rule_gui.py` | Rule generation, explanation, insights, JSON/xOSC export |
+| `scenario_engine.py` | Event detectors, GoRules engine, temporal matcher, descriptor, embedding, searchable sequences |
+| `signal_engine.py` | Context schema (jsonschema), normalization, kinematics, pairwise computer, `SignalConfig` |
+| `road_infrastructure.py` | Regions, centerlines, homography, Frenet projection, topology context |
+| `explanation_generator.py` | Human-readable scenario explanation |
+| `OpenScenarioExporter.py` | OpenSCENARIO 1.0 writer |
+| `lstm_single_bridge.py` | LSTM-VAE single/pair feature contracts, path assignment, latent signatures |
+| `scenario_gorules.json` | Config thresholds + decision nodes (external rule logic) |
 
-# Ownership Model
+## Requirements
 
-## MainApp
+- Python **≥ 3.10**
+- Core: `numpy`, `scipy`, `opencv-python`, `PyQt6`, `matplotlib`, `jsonschema`
+- Optional: `torch` (LSTM-VAE bridge), **esmini** (external, for `.xosc` replay)
 
-Responsibilities:
+## Installation
 
-- Module orchestration
-- Data routing
-- UI coordination
-
-MainApp performs no semantic reasoning.
-
----
-
-## RoadInfrastructure
-
-Authoritative owner of:
-
-- OpenDRIVE geometry
-- Lanelet-style graph topology
-- Region relationships
-- Junction relationships
-- Routing relationships
-
-RoadInfrastructure provides:
-
-```text
-successors
-predecessors
-adjacent
-shared junctions
-shared future junctions
-merge relationships
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e .                 # or: pip install -r requirements.txt
+pip install -e ".[lstm]"         # optional: LSTM-VAE bridge
 ```
 
-Topology knowledge must originate here.
+> **Run from the project root** — `scenario_gorules.json` is loaded relative to
+> the working directory.
 
-No downstream module should rebuild topology.
+## Running
 
----
-
-## LaneMapViewer
-
-Authoritative owner of:
-
-```text
-Trajectory processing
-Projection
-Topology extraction
-Route extraction
-Map context generation
-Semantic database generation
-Similarity indexing
+```bash
+python main_app.py    # or: trace
 ```
 
-LaneMapViewer owns map reasoning.
+Left pane = map viewer, right pane = scenario rule editor.
 
-LaneMapViewer does not own traffic behavior logic.
+## Input files
 
----
+| File | Format | Notes |
+|---|---|---|
+| Mask | `.png` / `.tif` / `.npy` | Integer region IDs, `0` = non-drivable |
+| Layout | JSON | Flat `{region_id: {...}}` or `{"regions": {...}}`. Consumed fields: `type` (`lane`, `connecting_lane`, `overlap`), `polygon`, `centerline`, `successors`, `predecessors`, `adjacent`, `adjacent_geometric`, `merges_with`, `shares_upcoming_junction_with`, `junction_id`, `is_connecting_road`, `roadId`/`laneId`, `members` (overlap) |
+| Homography | JSON | `{"transformation_matrix": 3×3 (px→world), "inverse_matrix": 3×3}` |
+| OpenDRIVE | `.xODR` | Referenced by the exported `.xosc` |
+| OpenLABEL | JSON | `{"openlabel": {"frames": {"<f>": {"objects": {"<oid>": {"object_data": {"rbbox": [{"name": "shape", "val": [cx, cy, w, h, ang, ...]}]}}}}}}}` |
+| Project | `.trace` | JSON of the five input paths (New / Open / Save) |
+| Paths library | JSON | For the LSTM bridge (`assign_path_id`), e.g. `cleaned/paths_library.json` |
 
-## Scenario Engine
+## Workflow A — Manual waypoints
 
-Authoritative owner of:
+1. **New** (or the individual Mask / Layout / H / xODR buttons) to load the map components.
+2. Mode **Manual**: press **✏️** next to V1, click ≥ 2 waypoints on the map (drag to
+   adjust); repeat for V2.
+3. Set **Dur** (s) and **FPS**; press **Generate** (resamples both trajectories
+   uniformly in arc length).
+4. Press **Apply** — builds and validates the scenario context.
+5. Right pane: **Generate Rule Suggestions** — populates the rule table (WHO /
+   WHAT / WHEN / WHERE / DETAILS) and the insights table.
+6. **Explain Rules** (optional "Explain only fired rules") — shows the scenario
+   signature, ordered semantic event sequence, metrics, rule timeline and insights.
+7. **Save Scenario JSON**, **Export Insights**, **Export OpenSCENARIO (.xosc)**.
+8. Optional: **Load Paths JSON** + **Load SINGLE Model (.pth)** for latent signatures.
 
-```text
-Context ingestion
-Context enrichment
-Rule input preparation
-Descriptor construction
+## Workflow B — OpenLABEL (JSON)
+
+1. Load map components **and** the OpenLABEL file.
+2. Mode **JSON**: choose start/end frame; the V1/V2 dropdowns list vehicles
+   present in the whole range.
+3. **Apply** — draws both trajectories and emits the context.
+4. Same steps 5–8 as above.
+5. **Build/Refresh DB Index** — writes an event-sequence database
+   (per-vehicle tracks + all vehicle pairs with ≥ 50 common frames and a spatial
+   proximity prefilter).
+6. **Load Semantic DB** + **Find Similar** — ranked candidates in the list;
+   clicking one previews its two trajectories on the map (yellow/magenta).
+   Without a generated base scenario, the button instead lists the top-50
+   candidate windows from the precomputed index
+   (`0.5·same_lane + 0.3·1/min_TTC + 0.2·1/min_dist`).
+
+## Scenario signature & similarity search
+
+The signature (shown in the explanation and stored in the descriptor) is:
+
+```
+S0.85_M1_D1_J3 || FOLLOW→DIVERGE | FOLLOW→LANE_CHANGE || ONE:waiting -> AB:proximity
 ```
 
-Scenario Engine prepares facts for GoRules.
+- `S…` fraction of frames on the same lane, `M/D` shared merge/diverge points,
+  `J` shared-junction frames.
+- Route chains are the per-actor transition token sequences.
+- Event chain: `AB:` if ≥ 2 participants else `ONE:`, time-ordered.
+- Bigram transitions and motifs feed both the deterministic embedding
+  (128-d, hash-bucketed tokens) and the DB indices
+  (`_event_index`, `_transition_index`).
 
-Scenario Engine should avoid hardcoded traffic behavior logic.
+Similarity scoring with a base scenario:
+`score = 0.60·(0.50·LCS + 0.20·Jaccard + 0.30·subsequence) + 0.40·route_topology`,
+candidates with `score < 0.15` are dropped, top 50 are listed.
 
----
+## OpenSCENARIO export
 
-## GoRules
+The exporter produces a conformant OpenSCENARIO 1.0 file: `FileHeader`,
+`ParameterDeclarations` (from numeric insights), `RoadNetwork` (relative
+`LogicFile` path when possible), `Entities` (two cars with bounding boxes and
+`DefaultDriver` controllers), and a `Storyboard` with:
 
-Authoritative owner of:
+- teleport to the first route waypoint's road/lane (`LanePosition`) or,
+  fallback, the trajectory start (`WorldPosition` with heading);
+- step speed action to the mean trajectory speed;
+- one `LaneChangeAction` per timeline-derived lane change (same road only);
+- a stop 0.5 s before the scenario end.
 
-```text
-Traffic events
-Behavior detection
-Insights
-Reasoning
+Event times from the engine are rescaled to the real scenario duration
+automatically. Replay with esmini:
+
+```bash
+esmini --scenario scenario.xosc --output
 ```
 
-All semantic interpretations should originate from GoRules.
+## Optional: LSTM-VAE signatures
 
-If a new traffic behavior is introduced, it should normally be implemented as a rule rather than Python code.
+`lstm_single_bridge.py` implements the exact training contract:
 
----
+- **Single**: per 10 Hz step `[d, d_dot, psi, psi_dot]` (normalized globally,
+  clipped) + path embedding; windowed encoding (default window 40, stride 5);
+  signature = mean `z_mu`, `z_std`, reconstruction error and robust
+  d/psi statistics.
+- **Pair (Option B1)**: 12-dim symmetric block with a shared path embedding.
 
-# Context Hierarchy
+Load via **Load Paths JSON** / **Load SINGLE Model (.pth)** in the scenario
+panel. The module imports without PyTorch (`available() == False`).
 
-TRACE uses two different context objects.
+## Configuration
 
----
+- `scenario_gorules.json` → `config`: all thresholds (`proximity_dist`,
+  `critical_distance_m`, `near_miss_ttc_s`, `shared_lane_following_fraction`,
+  `waiting_speed_threshold_mps`, `min_wait_duration_s`, …).
+  → `decision.rule_scope`: pair- vs vehicle-scoped subtypes.
+  → `decision.nodes`: expression + decision nodes (edit to change rule logic —
+  no code changes needed).
+  → `sequence_rules` (optional): temporal graph rules for the matcher.
+- `signal_engine.SignalConfig`: `same_lane_dd=1.2 m`, `aligned_ds=1.0`,
+  `lateral_threshold=0.5`, `interest_dist_m=8.0`, `interest_ttc_frames=3`.
 
-## 1. MapScenarioContext
 
-Generated by LaneMapViewer.
+## Development
 
-Contains only map-derived facts.
-
-Consumes:
-
-```text
-trajectories
-road topology
-metadata
+```bash
+pip install -e ".[dev]"
+ruff check .          # lint
+pytest                # tests live in tests/ (add your suite here)
 ```
 
-Produces:
+Debug contexts are dumped to `debug_contexts/` when enabled.
 
-```text
-route semantics
-topology facts
-interaction facts
-```
+## Troubleshooting
 
-This is the primary contract sent to Scenario Engine.
+| Symptom | Fix |
+|---|---|
+| "Context not ready for rule evaluation" | Press **Apply** in the viewer first |
+| No rules generated | Ensure `scenario_gorules.json` is in the CWD; check the log for GoRules warnings |
+| xOSC has an empty RoadNetwork | Load the `.xODR` before exporting |
+| "World conversion failed" | Check homography + mask coverage of the trajectory |
+| Similarity preview fails | Candidate vehicles must exist in the currently loaded OpenLABEL file |
+| "Too few trajectory points" | Pick a frame range where both vehicles are tracked |
 
----
+## License
 
-## 2. EngineContext
-
-Generated by Scenario Engine and GoRules.
-
-Contains:
-
-```text
-events
-behaviors
-insights
-descriptor
-```
-
-EngineContext is derived from MapScenarioContext.
-
-EngineContext must never be treated as an input source.
-
----
-
-# Why Scenario-Centric Context
-
-The system reasoner, semantic database, explanations, OpenSCENARIO export and future search all operate on:
-
-```text
-Actor A
-+
-Actor B
-+
-Coexistence Window
-```
-
-Example:
-
-```text
-Vehicle 17
-Vehicle 42
-Frames 1200-1800
-```
-
-Therefore the primary context unit is a scenario.
-
-Not a full recording.
-
----
-
-# Dataset vs Scenario
-
-## Dataset
-
-A recording contains many tracked objects.
-
-Example:
-
-```text
-600 vehicles
-30 minutes
-```
-
-Dataset is only a source of scenarios.
-
-Dataset is not the semantic unit.
-
----
-
-## Scenario
-
-The semantic unit is:
-
-```text
-actor pair
-+
-coexistence window
-```
-
-Example:
-
-```text
-Vehicle 21
-Vehicle 77
-Frames 4200-4650
-```
-
-This scenario becomes:
-
-- rule input
-- explanation input
-- semantic DB entry
-- OpenSCENARIO candidate
-- similarity-search candidate
-
----
-
-# MapScenarioContext Contract
-
-```python
-{
-    "kind": "map_scenario_context",
-
-    "version": "1.0",
-
-    "scope": {...},
-
-    "actors": {...},
-
-    "interaction": {...},
-
-    "meta": {...}
-}
-```
-# MapScenarioContext JSON Schema
-
-The MapScenarioContext is the authoritative contract produced by LaneMapViewer.
-
-It contains only map-derived facts and interaction facts.
-
-It must not contain:
-
-- events
-- behaviors
-- insights
-- descriptor data
-- rule evaluations
-
-Those belong to EngineContext.
-
----
-
-## Schema
-
-```json
-{
-  "kind": "map_scenario_context",
-  "version": "1.0",
-
-  "scope": {
-    "actor_a": "string",
-    "actor_b": "string",
-
-    "start_frame": 0,
-    "end_frame": 0,
-
-    "duration_seconds": 0.0
-  },
-
-  "actors": {
-
-    "A": {
-
-      "id": "string",
-
-      "timeline": {
-
-        "frame_id": {
-
-          "region_id": "string",
-
-          "world": {
-            "x": 0.0,
-            "y": 0.0
-          },
-
-          "sd": {
-            "s": 0.0,
-            "d": 0.0
-          },
-
-          "topology": [
-            "FLOW"
-          ]
-        }
-      },
-
-      "route_semantics": {
-
-        "route": [
-          "lane_id"
-        ],
-
-        "transitions": [
-          "FOLLOW",
-          "LANE_CHANGE",
-          "DIVERGE",
-          "TRANSFER"
-        ]
-      },
-
-      "topology_facts": {
-
-        "junctions": [
-          "junction_id"
-        ],
-
-        "merge_points": [
-          "lane_id"
-        ],
-
-        "diverge_points": [
-          "lane_id"
-        ]
-      }
-    },
-
-    "B": {
-
-      "id": "string",
-
-      "timeline": {},
-
-      "route_semantics": {},
-
-      "topology_facts": {}
-    }
-  },
-
-  "interaction": {
-
-    "timeline": {
-
-      "frame_id": {
-
-        "distance_m": 0.0,
-
-        "delta_s": 0.0,
-
-        "delta_d": 0.0,
-
-        "relative_order": "ahead|behind",
-
-        "overlap": false
-      }
-    }
-  },
-
-  "interaction_topology": {
-
-    "shared_lanes": [
-      "lane_id"
-    ],
-
-    "shared_lane_ratio": 0.0,
-
-    "shared_junctions": [
-      "junction_id"
-    ],
-
-    "common_merge_points": [
-      "lane_id"
-    ],
-
-    "common_diverge_points": [
-      "lane_id"
-    ],
-
-    "common_successors": [
-      "lane_id"
-    ],
-
-    "common_predecessors": [
-      "lane_id"
-    ],
-
-    "shared_future_junctions": [
-      "junction_id"
-    ],
-
-    "shared_route_segments": [
-      [
-        "lane_id",
-        "lane_id"
-      ]
-    ]
-  },
-
-  "meta": {
-
-    "lane_id": {
-
-      "type": "lane|connecting_lane",
-
-      "road_id": "string",
-
-      "junction_id": "string",
-
-      "successors": [],
-
-      "predecessors": [],
-
-      "adjacent": []
-    }
-  }
-}
-```
-
----
-
-# Semantic Rules
-
-## Actors
-
-Actors represent traffic participants within the selected coexistence window.
-
-Current implementation uses two actors:
-
-```text
-A
-B
-```
-
-This keeps the contract independent from specific IDs such as:
-
-```text
-V1
-V2
-```
-
----
-
-## Route Semantics
-
-Route semantics describe progression through the topology graph.
-
-Valid transition types:
-
-```text
-FOLLOW
-LANE_CHANGE
-DIVERGE
-TRANSFER
-```
-
-These are infrastructure facts.
-
-They are not events.
-
----
-
-## Topology Facts
-
-Topology facts describe graph properties.
-
-Examples:
-
-```text
-junctions visited
-merge points visited
-diverge points visited
-```
-
-They are independent from traffic behavior.
-
----
-
-## Interaction Topology
-
-Interaction topology describes route relationships between actors.
-
-Examples:
-
-```text
-shared route
-shared junction
-common merge
-common diverge
-shared future conflict zone
-```
-
-These are facts available to GoRules.
-
-They are not conclusions.
-
----
-
-## Meta
-
-Meta contains immutable infrastructure topology.
-
-This information originates from:
-
-```text
-OpenDRIVE
-Lanelet enrichment
-Layout metadata
-```
-
-and is the authoritative graph representation used throughout TRACE.
-
----
-
-# Explicit Non-Goals
-
-The following fields shall never appear inside MapScenarioContext:
-
-```text
-proximity
-waiting
-yield
-gap_acceptance
-dangerous_following
-near_miss
-connector_navigation
-complex_route_navigation
-```
-
-These belong to EngineContext because they are produced by GoRules.
-
----
-
-# Evolution Rules
-
-Future versions of MapScenarioContext may add:
-
-```text
-new topology facts
-new route semantics
-new interaction facts
-```
-
-but must not add:
-
-```text
-behavior classifications
-rule outputs
-semantic interpretations
-```
-
-The contract must remain purely factual.
-```
----
-
-# Scope
-
-Defines scenario boundaries.
-
-Example:
-
-```python
-{
-    "actor_a": "V1",
-    "actor_b": "V2",
-
-    "start_frame": 150,
-    "end_frame": 420
-}
-```
-
----
-
-# Actors
-
-Contains map-derived facts for individual actors.
-
-Example:
-
-```python
-actors = {
-
-    "A": {
-
-        "timeline": ...,
-
-        "route_semantics": ...,
-
-        "topology_facts": ...
-    },
-
-    "B": {
-        ...
-    }
-}
-```
-
-No events.
-
-No behaviors.
-
-No rule conclusions.
-
----
-
-# Interaction
-
-Contains pairwise facts.
-
-Example:
-
-```python
-distance
-delta_s
-delta_d
-ttc
-relative order
-```
-
-Plus shared topology facts.
-
-No events.
-
-No traffic interpretations.
-
----
-
-# Route Semantics
-
-Represents route progression through topology.
-
-Example:
-
-```python
-{
-    "route": [
-        "17",
-        "21",
-        "22"
-    ],
-
-    "transitions": [
-        "FOLLOW",
-        "FOLLOW",
-        "DIVERGE"
-    ]
-}
-```
-
-Route semantics are infrastructure facts.
-
-They are not events.
-
-They are not behaviors.
-
----
-
-# Topology Facts
-
-Produced directly from topology.
-
-Examples:
-
-```python
-junctions
-merge_points
-diverge_points
-```
-
-Interaction examples:
-
-```python
-shared_lanes
-shared_lane_ratio
-shared_junctions
-common_merge_points
-common_diverge_points
-```
-
-All topology facts must remain generic.
-
-No roundabout-specific concepts.
-
-No intersection-specific concepts.
-
----
-
-# Route Semantics Are Not Events
-
-Correct:
-
-```text
-FOLLOW
-DIVERGE
-TRANSFER
-```
-
-Incorrect:
-
-```text
-yield
-merge_behavior
-roundabout_entry
-```
-
-Behavioral interpretations belong to GoRules.
-
----
-
-# EngineContext
-
-Produced by Scenario Engine.
-
-Consumes:
-
-```text
-MapScenarioContext
-```
-
-Produces:
-
-```python
-{
-    "kind": "engine_context",
-
-    "events": [...],
-
-    "behaviors": [...],
-
-    "insights": [...],
-
-    "descriptor": {...}
-}
-```
-
----
-
-# Events
-
-Generated by GoRules.
-
-Examples:
-
-```text
-proximity
-waiting
-lane_change
-```
-
-Events are observable traffic situations.
-
----
-
-# Behaviors
-
-Generated by GoRules.
-
-Examples:
-
-```text
-yield
-gap_acceptance
-dangerous_following
-connector_navigation
-near_miss
-```
-
-Behaviors are interpretations.
-
-Events and behaviors must remain separate.
-
----
-
-# Descriptor
-
-The descriptor is the canonical searchable representation.
-
-Built after GoRules execution.
-
-Contains:
-
-```text
-topology fingerprints
-route fingerprints
-event fingerprints
-behavior fingerprints
-signal summaries
-```
-
-Descriptor is the primary search artifact.
-
----
-
-# Similarity Search
-
-(Not currently the active focus.)
-
-Similarity search operates on scenario descriptors generated after GoRules reasoning.
-
-The searchable unit remains:
-
-```text
-actor pair
-+
-coexistence window
-```
-
-not entire datasets.
-
----
-
-# Explanation Engine
-
-Consumes:
-
-```text
-MapScenarioContext
-Events
-Behaviors
-Descriptor
-```
-
-Produces:
-
-```text
-Scenario summaries
-Behavior explanations
-Risk observations
-Traffic descriptions
-```
-
-No new semantics should be invented here.
-
----
-
-# OpenLABEL Alignment
-
-Semantic database targets OpenLABEL concepts:
-
-```text
-Objects
-Relations
-Contexts
-Actions
-Attributes
-```
-
-Topology and route semantics are exported as context.
-
-Events and behaviors are stored separately.
-
----
-
-# OpenSCENARIO Alignment
-
-OpenSCENARIO export consumes:
-
-```text
-MapScenarioContext
-Events
-Behaviors
-Routes
-```
-
-and generates:
-
-```text
-Entities
-Routes
-Actions
-Triggers
-Storyboards
-```
-
-The exporter translates semantic reasoning but does not define it.
-
----
-
-# Rules For Future Development
-
-Rule 1
-
-Infrastructure facts belong to RoadInfrastructure and LaneMapViewer.
-
-Rule 2
-
-MapScenarioContext contains facts only.
-
-Rule 3
-
-Scenario Engine prepares rule inputs.
-
-Rule 4
-
-GoRules owns events and behaviors.
-
-Rule 5
-
-Context must not contain rule conclusions.
-
-Rule 6
-
-Route semantics are not events.
-
-Rule 7
-
-Topology facts are not behaviors.
-
-Rule 8
-
-Always add infrastructure facts before adding new traffic rules.
-
-Rule 9
-
-Avoid map-specific semantics.
-
-Rule 10
-
-If a concept can be represented as a fact, place it in MapScenarioContext before considering a GoRules implementation.
+Add a `LICENSE` file (e.g., MIT) before publishing.
