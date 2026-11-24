@@ -10,7 +10,7 @@
         "critical_distance_m": 5.0,
         "dangerous_headway_m": 8.0,
         "following_headway_m": 30.0,
-        "same_lane_following_fraction": 0.75,
+        "shared_lane_following_fraction": 0.75,
         "near_miss_lateral_rate": 0.2,
         "near_miss_probability_threshold": 0.4,
         "avoidance_probability_threshold": 0.4,
@@ -86,6 +86,35 @@
             "stopped_duration_s",
             "config"
         ],
+		  "rule_scope": {
+			"lane_change": "vehicle",
+			"aggressive_lane_change": "vehicle",
+			"smooth_lane_change": "vehicle",
+
+			"trace_multi_stage_lane_positioning": "vehicle",
+			"trace_complex_route_navigation": "vehicle",
+			"trace_connector_navigation": "vehicle",
+			"erratic_lane_behavior": "vehicle",
+
+			"waiting_for_gap": "vehicle",
+
+			"cut_in": "pair",
+			"merge": "pair",
+			"yield": "pair",
+			"junction_convergence": "pair",
+			"junction_crossing_interaction": "pair",
+			"close_cooperative_pass": "pair",
+			"cooperative_junction_crossing": "pair",
+			"critical_proximity": "pair",
+			"tailgating": "pair",
+			"true_car_following": "pair",
+			"near_miss_refined": "pair",
+			"near_miss_evasive": "pair",
+			"avoidance": "pair",
+			"overtake": "pair",
+			"waiting_for_merge_gap": "pair",
+			"gap_acceptance": "pair"
+		  },
         "nodes": [
             {
                 "id": "lateral_intensity",
@@ -370,7 +399,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && shared_lane_fraction > config.same_lane_following_fraction && proximity_level < config.dangerous_headway_m",
+                        "if": "event.type == 'proximity' && shared_lane_fraction > config.shared_lane_following_fraction && proximity_level < config.dangerous_headway_m",
                         "then": {
                             "interaction": {
                                 "type": "dangerous_following",
@@ -385,7 +414,7 @@
                 "type": "decision",
                 "conditions": [
                     {
-                        "if": "event.type == 'proximity' && shared_lane_fraction > config.same_lane_following_fraction && event.features.mean_dist < config.following_headway_m",
+                        "if": "event.type == 'proximity' && shared_lane_fraction > config.shared_lane_following_fraction && event.features.mean_dist < config.following_headway_m",
                         "then": {
                             "interaction": {
                                 "type": "car_following",

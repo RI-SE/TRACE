@@ -14,10 +14,6 @@ from scenario_engine import (
     ScenarioRules,
     suggest_rules_combined,
     build_engine_insight_context,
-    enrich_with_topology,
-    enrich_with_signal_metrics,
-    detect_events,
-    _build_event_timeline,
 )
 
 from lstm_single_bridge import LSTMSingleBridge, load_single_model, load_paths_json
@@ -605,8 +601,16 @@ class ScenarioRuleGUI(QWidget):
         return rules
 
     def _derive_scenario_label(self, ctx):
-        return ctx.get("derived", {}).get("signals", {}).get(
-            "path_relationship", "unknown"
+
+        topo = ctx.get(
+            "interaction_topology",
+            {}
+        )
+
+        return (
+            f"M{len(topo.get('common_merge_points',[]))}"
+            f"_D{len(topo.get('common_diverge_points',[]))}"
+            f"_J{topo.get('shared_junction_count',0)}"
         )
 
     def _format_rule_summary(self, rule, ctx):
@@ -931,11 +935,9 @@ class ScenarioRuleGUI(QWidget):
 
         add(
             "shared_junction_count",
-            len(
-                interaction_topology.get(
-                    "shared_junctions",
-                    []
-                )
+            interaction_topology.get(
+                "shared_junction_count",
+                0
             )
         )
 
@@ -1233,11 +1235,15 @@ class ScenarioRuleGUI(QWidget):
             QMessageBox.warning(self, "Missing Duration", "Duration not provided by viewer.")
             return
         duration = self.duration_seconds
+        vehicles = self._actors_to_vehicle_view(
+            self._engine_context
+        )
+
         scen = ScenarioRules(
             scenario_name=name,
             duration_seconds=duration,
-            vehicle1=self._engine_context["vehicles"]["V1"],
-            vehicle2=self._engine_context["vehicles"]["V2"],
+            vehicle1=vehicles["V1"],
+            vehicle2=vehicles["V2"],
             derived_rules=self._rules,
             notes=self.edit_notes.toPlainText()
         )

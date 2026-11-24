@@ -21,7 +21,12 @@ from PyQt6.QtWidgets import (
     QProgressDialog, QApplication, QDoubleSpinBox, QSpinBox, QTextEdit, QListWidget, QListWidgetItem
 )
 
-from scenario_engine import build_engine_insight_context, enrich_with_signal_metrics, enrich_with_topology, detect_events, _build_event_timeline, build_searchable_event_sequence
+from scenario_engine import (
+    build_engine_insight_context,
+    build_searchable_event_sequence,
+    build_scenario_descriptor,
+    suggest_rules_combined
+)
 from road_infrastructure import RoadInfrastructure
 from signal_engine import ContextBuilder, SignalConfig, normalize_context, validate_context, PixelPoint, WorldPoint, VehicleTrajectory
 
@@ -551,12 +556,15 @@ class LaneMapViewer(QWidget):
             return
 
         start_frame = track.get(
-            "start_frame"
+            "start_frame",
+            track.get("first_frame")
         )
 
         end_frame = track.get(
-            "end_frame"
+            "end_frame",
+            track.get("last_frame")
         )
+
 
         if (
             start_frame is None
@@ -1891,8 +1899,8 @@ class LaneMapViewer(QWidget):
             return self._fail_ctx(ctx, "empty_pairwise")
         
         return self._build_pair_scenario_context(
-            actor_a_id="A",
-            actor_b_id="B",
+            actor_a_id= self.v1_id_box.currentText() or "V1",
+            actor_b_id= self.v2_id_box.currentText() or "V2",
             ctx_a=ctx_a,
             ctx_b=ctx_b,
             pair=pair,
@@ -1916,52 +1924,11 @@ class LaneMapViewer(QWidget):
         - Fall back to features, interaction, and metrics.
         - Preserve from/to region for transition events.
         """
-        ctx = copy.deepcopy(ctx)
+        ctx = ctx.copy()
         if not isinstance(ctx, dict) or not ctx:
             return {}
 
         ctx["ready"] = True
-        if "vehicles" not in ctx:
-
-            actors = ctx.get("actors", {})
-
-            ctx["vehicles"] = {
-
-                "V1": {
-                    "timeline":
-                        actors.get(
-                            "A",
-                            {}
-                        ).get(
-                            "timeline",
-                            {}
-                        )
-                },
-
-                "V2": {
-                    "timeline":
-                        actors.get(
-                            "B",
-                            {}
-                        ).get(
-                            "timeline",
-                            {}
-                        )
-                }
-            }
-
-        if "pair" not in ctx:
-
-            ctx["pair"] = {
-                "timeline":
-                    ctx.get(
-                        "interaction_facts",
-                        {}
-                    ).get(
-                        "timeline",
-                        {}
-                    )
-            }
 
         def _finite_float(value, default=None):
             try:
@@ -2010,35 +1977,26 @@ class LaneMapViewer(QWidget):
 
         ctx = build_engine_insight_context(
             context=ctx,
+            duration=duration
+        )
+
+        rules = suggest_rules_combined(
             duration=duration,
+            meta=ctx.get("meta"),
+            context=ctx
         )
 
-        ctx = enrich_with_topology(ctx)
-        ctx = enrich_with_signal_metrics(ctx)
-
-        engine = (
-            ctx.get("derived", {})
-            .get("engine", {})
+        timeline = (
+            ctx.get(
+                "event_timeline",
+                []
+            )
         )
-
-        has_v1 = bool(engine.get("v1_sd"))
-        has_v2 = bool(engine.get("v2_sd"))
-
-        if not (has_v1 or has_v2):
-            ctx["events"] = []
-            ctx["event_timeline"] = []
-            ctx["event_transitions"] = []
-            ctx["event_stats"] = {}
-            return ctx
 
         # --------------------------------------------------
         # Event detection
         # --------------------------------------------------
 
-        raw_events = detect_events(ctx) or []
-        ctx["events"] = raw_events
-
-        timeline = _build_event_timeline(ctx) or []
 
         valid_events = []
 
@@ -2289,21 +2247,17 @@ class LaneMapViewer(QWidget):
             .get("signals", {})
         )
 
-        ctx["path_relationship"] = signals.get(
-            "path_relationship",
-            ctx.get("path_relationship", "unknown"),
-        )
-        ctx["path_semantics"] = signals.get(
-            "path_semantics",
-            ctx.get("path_semantics", {}),
-        )
-
         ctx["event_time_origin"] = min_time
         ctx["event_time_span"] = observed_span
         ctx["event_timeline"] = normalized
         ctx["event_transitions"] = transitions
         ctx["event_stats"] = stats
-
+        if "scenario_descriptor" not in ctx.get("derived", {}):
+            ctx.setdefault("derived", {})
+            ctx["derived"]["scenario_descriptor"] = build_scenario_descriptor(
+                ctx,
+                rules
+            )
         return ctx
 
     def _fail_ctx(
@@ -3331,6 +3285,115 @@ class LaneMapViewer(QWidget):
 
         return result
 
+    def _candidate_signature(
+            self,
+            track):
+
+        routes = track.get(
+            "route_signatures",
+            []
+        )
+
+        topo = " | ".join(
+            "→".join(r)
+            for r in routes
+        )
+
+        seq = " -> ".join(
+
+            ev.get(
+                "event_token",
+                ev.get(
+                    "event",
+                    "?"
+                )
+            )
+
+            for ev in track.get(
+                "event_sequence",
+                []
+            )
+        )
+
+        return (
+            f"{topo}\n{seq}"
+        )
+
+    def _format_track_event_line(self, track):
+        """
+        One-line event timeline for the candidate list.
+
+        lane_change@0.5s(0.2s) 12>13 | +0.4s waiting@0.9s(2.3s)
+        | +4.9s proximity@5.8s(1.6s) | +1.5s waiting@7.3s(4.9s)
+
+        @t    event start (engine time, seconds)
+        (x s) event duration (recovered: duration_ratio * span)
+        +x s  start-to-start gap to the previous event
+        a>b   from_region > to_region (lane_change events)
+        """
+        seq = [
+            e for e in (track.get("event_sequence", []) or [])
+            if isinstance(e, dict)
+        ]
+
+        if not seq:
+            return "no events"
+
+        # Ratios are normalized against the observed span, which the
+        # track does not store. Recover it exactly:
+        #   span = (t_j - t_i) / (start_ratio_j - start_ratio_i)
+        span = None
+        for i in range(len(seq)):
+            ri = seq[i].get("start_ratio")
+            ti = seq[i].get("_start")
+            if not (isinstance(ri, (int, float)) and isinstance(ti, (int, float))):
+                continue
+            for j in range(i + 1, len(seq)):
+                rj = seq[j].get("start_ratio")
+                tj = seq[j].get("_start")
+                if not (isinstance(rj, (int, float)) and isinstance(tj, (int, float))):
+                    continue
+                dr = rj - ri
+                if dr > 1e-9:
+                    span = (tj - ti) / dr
+                    break
+            if span is not None:
+                break
+
+        parts = []
+        prev_t = None
+
+        for e in seq:
+            t0 = e.get("_start")
+            if not isinstance(t0, (int, float)):
+                continue
+
+            name = str(e.get("event", "?"))
+
+            dur = e.get("duration_ratio")
+            if isinstance(dur, (int, float)) and span:
+                dur_txt = f"({dur * span:.1f}s)"
+            elif isinstance(dur, (int, float)):
+                dur_txt = f"({dur * 100:.0f}%)"
+            else:
+                dur_txt = ""
+
+            region_txt = ""
+            fr = e.get("from_region")
+            to = e.get("to_region")
+            if fr is not None and to is not None:
+                region_txt = f" {fr}>{to}"
+
+            token = f"{name}@{t0:.1f}s{dur_txt}{region_txt}"
+
+            if prev_t is not None:
+                token = f"+{t0 - prev_t:.1f}s {token}"
+
+            parts.append(token)
+            prev_t = t0
+
+        return " | ".join(parts)
+
     def find_similar_scenarios(self):
         """
         If 'Use precomputed index' is enabled and a precompute exists:
@@ -3361,7 +3424,7 @@ class LaneMapViewer(QWidget):
 
             # Score windows: prioritize lane consistency, then short TTC, then short distance
             def wscore(w):
-                s_lane = w.get("same_lane_ratio", 0.0)
+                s_lane = w.get("shared_lane_fraction", 0.0)
                 inv_ttc = 0.0 if not (w.get("min_ttc", float("inf")) > 0) else 1.0 / w.get("min_ttc", float("inf"))
                 inv_dist = 0.0 if not (w.get("min_dist", 1e9) > 0) else 1.0 / w.get("min_dist", 1e9)
                 return (0.5 * s_lane) + (0.3 * inv_ttc) + (0.2 * inv_dist)
@@ -3373,7 +3436,7 @@ class LaneMapViewer(QWidget):
                 ttc_s = "inf" if mt == float("inf") else f"{mt:.2f}"
                 lines.append(
                     f"V1={w['v1']}  V2={w['v2']}  frames=[{w['start']}, {w['end']}], "
-                    f"min_dist={w['min_dist']:.1f}, min_ttc={ttc_s}, same_lane={w['same_lane_ratio']:.2f}"
+                    f"min_dist={w['min_dist']:.1f}, min_ttc={ttc_s}, same_lane={w['shared_lane_fraction']:.2f}"
                 )
             msg = "Candidate (v1, v2, [start,end]) windows from index:\n\n" + "\n".join(lines)
             self.log_info("Suggested Candidate Windows" + msg)
@@ -3503,6 +3566,16 @@ class LaneMapViewer(QWidget):
                 )
             )
 
+            if not fp:
+                # pair tracks do not store event_fingerprint -
+                # derive it from the sequence (raw names, matching
+                # the query side)
+                fp = {
+                    e["event"]
+                    for e in cand_sequence
+                    if isinstance(e, dict)
+                }
+
             if (
                 len(
                     query_events & fp
@@ -3510,123 +3583,71 @@ class LaneMapViewer(QWidget):
                 < 1
             ):
                 continue
+
             topology_score = 0.0
 
             try:
 
-                q_track = (
-                    getattr(
-                        self.scenario_gui,
-                        "_selected_track",
-                        None
-                    )
-                )
-                q_it = (
-                    q_track.get(
-                        "interaction_topology",
-                        {}
-                    )
+                descriptor = (
+                    self.scenario_gui
+                    ._engine_context
+                    .get("derived", {})
+                    .get("scenario_descriptor", {})
                 )
 
-                c_it = (
-                    track.get(
-                        "interaction_topology",
-                        {}
-                    )
+                q_sig = (
+                    descriptor
+                    .get("search_index", {})
+                    .get("semantic_signature", {})
                 )
 
-                scores = []
+                c_sig = (
+                    track.get("semantic_signature", {})
+                )
 
-                for key in (
-                    "shared_lane_ratio",
-                ):
-
-                    qv = float(
-                        q_it.get(key, 0.0)
+                q_routes = [
+                    list(x)
+                    for x in q_sig.get(
+                        "route_signatures",
+                        []
                     )
+                ]
 
-                    cv = float(
-                        c_it.get(key, 0.0)
+                c_routes = [
+                    list(x)
+                    for x in c_sig.get(
+                        "route_signatures",
+                        []
                     )
+                ]
 
-                    scores.append(
-                        1.0
-                        -
-                        min(
-                            abs(qv - cv),
-                            1.0
-                        )
-                    )
+                route_scores = []
 
-                for key in (
-                    "common_merge_points",
-                    "common_diverge_points"
-                ):
+                for qr in q_routes:
 
-                    a = set(
-                        map(
-                            str,
-                            q_it.get(key, [])
-                        )
-                    )
+                    best = 0.0
 
-                    b = set(
-                        map(
-                            str,
-                            c_it.get(key, [])
-                        )
-                    )
+                    for cr in c_routes:
 
-                    if a or b:
-
-                        scores.append(
-                            len(a & b)
-                            /
-                            max(
-                                len(a | b),
-                                1
+                        best = max(
+                            best,
+                            self._sequence_similarity(
+                                qr,
+                                cr
                             )
                         )
 
-                route_score_v1 = (
-                    self._sequence_similarity(
-                        q_track.get(
-                            "topology_v1",
-                            []
-                        ),
-                        track.get(
-                            "topology_v1",
-                            []
-                        )
-                    )
-                )
-
-                route_score_v2 = (
-                    self._sequence_similarity(
-                        q_track.get(
-                            "topology_v2",
-                            []
-                        ),
-                        track.get(
-                            "topology_v2",
-                            []
-                        )
-                    )
-                )
-
-                scores.extend([
-                    route_score_v1,
-                    route_score_v2
-                ])
+                    route_scores.append(best)
 
                 topology_score = (
-                    float(np.mean(scores))
-                    if scores
-                    else 0.0
+                    sum(route_scores)
+                    /
+                    max(len(route_scores), 1)
                 )
 
             except Exception:
-                pass
+                topology_score = 0.0            
+
             event_score = (
                 self._event_similarity(
                     query_sequence,
@@ -3635,9 +3656,9 @@ class LaneMapViewer(QWidget):
             )
 
             score = (
-                0.45 * event_score
+                0.60 * event_score
                 +
-                0.55 * topology_score
+                0.40 * topology_score
             )
 
             if score < 0.15:
@@ -3659,21 +3680,19 @@ class LaneMapViewer(QWidget):
         for r in results:
 
             track = r["track"]
+            route_sig = tuple(
+
+                tuple(r)
+
+                for r in track.get(
+                    "route_signatures",
+                    []
+                )
+            )
+
             sig = (
 
-                tuple(
-                    track.get(
-                        "topology_v1",
-                        []
-                    )
-                ),
-
-                tuple(
-                    track.get(
-                        "topology_v2",
-                        []
-                    )
-                ),
+                route_sig,
 
                 tuple(
                     e["event_token"]
@@ -3711,30 +3730,45 @@ class LaneMapViewer(QWidget):
 
             track = r["track"]
 
-            seq = " -> ".join(
-                ev.get(
-                    "event_token",
-                    ev["event"]
-                )
-                for ev in track.get(
-                    "event_sequence",
-                    []
-                )
+            seq = self._candidate_signature(
+                track
             )
 
             it = track.get(
                 "interaction_topology",
                 {}
             )
+
+            actor_ids = track.get("actor_ids", []) or []
+
+            if track.get("scope") == "pair" and len(actor_ids) >= 2:
+                actors_txt = f"A={actor_ids[0]} B={actor_ids[1]}"
+            elif actor_ids:
+                actors_txt = f"A={actor_ids[0]} (vehicle)"
+            else:
+                actors_txt = "A=- B=-"
+
+            # vehicle tracks store first_frame/last_frame,
+            # pair tracks store start_frame/end_frame
+            fr_start = track.get(
+                "start_frame",
+                track.get("first_frame")
+            )
+            fr_end = track.get(
+                "end_frame",
+                track.get("last_frame")
+            )
+
             item_text = (
-                f"{idx}. "
-                f"{r['score']:.3f} | "
-                f"J={len(it.get('shared_junctions',[]))} "
-                f"M={len(it.get('common_merge_points',[]))} "
-                f"D={len(it.get('common_diverge_points',[]))}| "
-                f"{track.get('start_frame')}-"
-                f"{track.get('end_frame')}\n"
-                f"{seq}"
+                f"{idx}. {r['score']:.3f} | "
+                f"{actors_txt} | "
+                f"J={it.get('shared_junction_count', 0)} "
+                f"M={len(it.get('common_merge_points', []))} "
+                f"D={len(it.get('common_diverge_points', []))} | "
+                f"fr {fr_start}-{fr_end} "
+                f"({track.get('frame_count', '?')}f)\n"
+                f"{seq}\n"
+                f"{self._format_track_event_line(track)}"
             )
 
             item = QListWidgetItem(
@@ -3768,35 +3802,22 @@ class LaneMapViewer(QWidget):
             []
         )
 
-        if (
-            "_event_index" in self.semantic_db
-            and
-            "_transition_index" in self.semantic_db
-        ):
-
-            self.log_info(
-                f"Loaded event database "
-                f"({len(tracks)} tracks)"
-            )
-
-            self._loaded_db_path = path
-            return
-
         event_index = {}
         transition_index = {}
 
         for idx, track in enumerate(tracks):
-
             seq = track.get(
                 "event_sequence",
                 []
             )
 
             events = [
-                e["event"]
+                e.get(
+                    "event",
+                    "?"
+                )
                 for e in seq
                 if isinstance(e, dict)
-                and "event" in e
             ]
 
             for ev in set(events):
@@ -3885,81 +3906,45 @@ class LaneMapViewer(QWidget):
             (m + n)
         )
 
-    def _event_similarity(
-            self,
-            query,
-            candidate):
+    def _event_similarity(self, query, candidate):
 
         if not query or not candidate:
             return 0.0
 
-        q_events = [
-            e["event_token"]
+        q = [
+            e["event"]
             for e in query
         ]
 
-        c_events = [
-            e["event_token"]
+        c = [
+            e["event"]
             for e in candidate
         ]
 
-        order_score = (
-            self._sequence_similarity(
-                q_events,
-                c_events
-            )
+        lcs_score = self._sequence_similarity(q, c)
+
+        q_set = set(q)
+        c_set = set(c)
+
+        jaccard = (
+            len(q_set & c_set)
+            /
+            max(len(q_set | c_set), 1)
         )
 
-        q_types = {
-            e["event"]
-            for e in query
-        }
-
-        c_types = {
-            e["event"]
-            for e in candidate
-        }
-
-        overlap_score = (
-            len(q_types & c_types)
-            /
-            max(
-                len(q_types | c_types),
-                1
-            )
+        query_is_subsequence = (
+            lcs_score >=
+            len(q) / max(len(c), len(q))
         )
 
-        q_trans = {
-            f"{a}>{b}"
-            for a, b in zip(
-                q_events[:-1],
-                q_events[1:]
-            )
-        }
-
-        c_trans = {
-            f"{a}>{b}"
-            for a, b in zip(
-                c_events[:-1],
-                c_events[1:]
-            )
-        }
-
-        transition_score = (
-            len(q_trans & c_trans)
-            /
-            max(
-                len(q_trans | c_trans),
-                1
-            )
+        subsequence_bonus = (
+            1.0 if query_is_subsequence else 0.0
         )
 
         return (
-            0.40 * order_score
-            +
-            0.30 * transition_score
-            +
-            0.30 * overlap_score
+            0.50 * lcs_score
+            + 0.20 * jaccard
+            + 0.30 * subsequence_bonus
         )
 
 
@@ -4039,19 +4024,18 @@ class LaneMapViewer(QWidget):
         scores = {}
 
         #
-        # IMPORTANT:
-        # Use raw event names only.
-        # Do NOT use event_token here.
+        # Index convention (must match load_semantic_database):
+        #   _event_index      -> keyed by RAW event name ("waiting")
+        #   _transition_index -> keyed by token pairs
+        #                        ("actorA:waiting>actorA,actorB:proximity")
         #
         query_events = {
             e["event"]
             for e in query_sequence
         }
 
-        print("query_events", query_events)
-
         query_transitions = {
-            f"{a['event']}>{b['event']}"
+            f"{a['event_token']}>{b['event_token']}"
             for a, b in zip(
                 query_sequence[:-1],
                 query_sequence[1:]
@@ -4064,6 +4048,7 @@ class LaneMapViewer(QWidget):
                 ev,
                 []
             )
+
             print(
                 ev,
                 len(matches)
@@ -4111,9 +4096,10 @@ class LaneMapViewer(QWidget):
 
         return [
             idx
-            for idx, _
-            in ranked[:500]
-        ]
+            for idx, score
+            in ranked
+            if score > 0
+        ][:200]
 
     def _ctx_events(self, ctx):
 
@@ -4236,217 +4222,106 @@ class LaneMapViewer(QWidget):
             "transitions": transitions
         }
 
-    def _build_topology_facts(
-            self,
-            ctx_a,
-            ctx_b):
+    def _build_topology_facts(self, ctx_a, ctx_b):
+        meta = getattr(self.road, "meta", {}) or {}
 
-        meta = getattr(
-            self.road,
-            "meta",
-            {}
-        ) or {}
-
-        actor_facts = {}
-        routes = {}
-
-        for actor, ctx in (
-            ("A", ctx_a),
-            ("B", ctx_b)
-        ):
+        def actor_signature(ctx):
+            timeline = ctx.get("timeline", {})
 
             route = []
             prev = None
 
-            for _, sample in sorted(
-                ctx.get(
-                    "timeline",
-                    {}
-                ).items()
-            ):
-
-                lane = sample.get(
-                    "region_id"
-                )
-
+            for _, sample in sorted(timeline.items()):
+                lane = sample.get("region_id")
                 if lane is None:
                     continue
 
                 lane = str(lane)
 
-                if lane != prev:
-                    route.append(lane)
+                if lane == prev:
+                    continue
 
+                route.append(lane)
                 prev = lane
 
-            routes[actor] = route
-
-            junctions = set()
-            merges = set()
-            diverges = set()
-            successors = set()
-            predecessors = set()
+            topology_sequence = []
+            merge_points = []
+            diverge_points = []
 
             for lane in route:
+                m = meta.get(str(lane), {}) or {}
 
-                m = meta.get(
-                    lane,
-                    {}
-                )
-
-                jid = m.get(
-                    "junction_id"
-                )
-
-                if jid is not None:
-                    junctions.add(
-                        str(jid)
-                    )
-
-                preds = {
-                    str(x)
-                    for x in m.get(
-                        "predecessors",
-                        []
-                    )
-                }
-
-                succs = {
-                    str(x)
-                    for x in m.get(
-                        "successors",
-                        []
-                    )
-                }
-
-                predecessors |= preds
-                successors |= succs
+                preds = m.get("predecessors", []) or []
+                succs = m.get("successors", []) or []
 
                 if len(preds) > 1:
-                    merges.add(lane)
+                    topology_sequence.append("CONVERGE")
+                    if lane not in merge_points:
+                        merge_points.append(lane)
 
                 if len(succs) > 1:
-                    diverges.add(lane)
+                    topology_sequence.append("DIVERGE")
+                    if lane not in diverge_points:
+                        diverge_points.append(lane)
 
-            actor_facts[actor] = {
+                if m.get("junction_id") is not None:
+                    topology_sequence.append("JUNCTION")
 
-                "junctions":
-                    sorted(junctions),
+                if m.get("is_connecting_road", False):
+                    topology_sequence.append("CONNECTOR")
 
-                "merge_points":
-                    sorted(merges),
+            compressed = []
 
-                "diverge_points":
-                    sorted(diverges),
+            for token in topology_sequence:
+                if not compressed or compressed[-1] != token:
+                    compressed.append(token)
 
-                "_successors":
-                    successors,
-
-                "_predecessors":
-                    predecessors,
-
-                "_route":
-                    route
+            return {
+                "topology_sequence": compressed,
+                "route_length": len(route),
+                "merge_points": merge_points,
+                "diverge_points": diverge_points
             }
 
-        route_a = actor_facts["A"]["_route"]
-        route_b = actor_facts["B"]["_route"]
+        a = actor_signature(ctx_a)
+        b = actor_signature(ctx_b)
 
-        shared_segments = []
-
-        common_route = sorted(
-            set(route_a) &
-            set(route_b)
+        shared_topology = len(
+            set(a["topology_sequence"])
+            &
+            set(b["topology_sequence"])
         )
 
-        if common_route:
-            shared_segments.append(
-                common_route
-            )
+        # Common merge/diverge POINTS: lanes that are merge/diverge
+        # lanes (per meta topology) AND are traversed by both actors.
+        b_merges = set(b["merge_points"])
+        b_diverges = set(b["diverge_points"])
 
-        interaction = {
+        common_merge = [
+            lane for lane in a["merge_points"] if lane in b_merges
+        ]
+        common_diverge = [
+            lane for lane in a["diverge_points"] if lane in b_diverges
+        ]
 
-            "shared_lanes":
-                common_route,
+        return (
+            {
+                "A": a,
+                "B": b
+            },
+            {
+                "topology_sequence_A": a["topology_sequence"],
+                "topology_sequence_B": b["topology_sequence"],
+                "shared_topology_tokens": shared_topology,
+                "topology_complexity":
+                    len(a["topology_sequence"])
+                    +
+                    len(b["topology_sequence"]),
+                "common_merge_points": common_merge,
+                "common_diverge_points": common_diverge
+            }
+        )
 
-            "shared_lane_ratio":
-                len(common_route) /
-                max(
-                    len(
-                        set(route_a)
-                        |
-                        set(route_b)
-                    ),
-                    1
-                ),
-
-            "shared_junctions": [],
-            "common_merge_points":
-                sorted(
-                    set(
-                        actor_facts["A"]["merge_points"]
-                    )
-                    &
-                    set(
-                        actor_facts["B"]["merge_points"]
-                    )
-                ),
-
-            "common_diverge_points":
-                sorted(
-                    set(
-                        actor_facts["A"]["diverge_points"]
-                    )
-                    &
-                    set(
-                        actor_facts["B"]["diverge_points"]
-                    )
-                ),
-
-            "common_successors":
-                sorted(
-                    actor_facts["A"]["_successors"]
-                    &
-                    actor_facts["B"]["_successors"]
-                ),
-
-            "common_predecessors":
-                sorted(
-                    actor_facts["A"]["_predecessors"]
-                    &
-                    actor_facts["B"]["_predecessors"]
-                ),
-
-            "shared_future_junctions":
-                sorted(
-                    set(
-                        actor_facts["A"]["junctions"]
-                    )
-                    &
-                    set(
-                        actor_facts["B"]["junctions"]
-                    )
-                ),
-
-            "shared_route_segments":
-                shared_segments
-        }
-
-        for actor in ("A", "B"):
-            actor_facts[actor].pop(
-                "_successors",
-                None
-            )
-            actor_facts[actor].pop(
-                "_predecessors",
-                None
-            )
-            actor_facts[actor].pop(
-                "_route",
-                None
-            )
-
-        return actor_facts, interaction
 
     def _build_interaction_facts(
             self,
@@ -4487,12 +4362,24 @@ class LaneMapViewer(QWidget):
             start_frame,
             end_frame):
 
-        route_a = self._build_route_semantics(
-            ctx_a["timeline"]
+        route_a = (
+            ctx_a.get(
+                "route_semantics"
+            )
+            or
+            self._build_route_semantics(
+                ctx_a["timeline"]
+            )
         )
 
-        route_b = self._build_route_semantics(
-            ctx_b["timeline"]
+        route_b = (
+            ctx_b.get(
+                "route_semantics"
+            )
+            or
+            self._build_route_semantics(
+                ctx_b["timeline"]
+            )
         )
 
         actor_topology, interaction_topology = (
@@ -4526,8 +4413,12 @@ class LaneMapViewer(QWidget):
                 )
 
         interaction_topology[
-            "shared_junctions"
+            "shared_junction_frames"
         ] = shared_frames
+
+        interaction_topology[
+            "shared_junction_count"
+        ] = len(shared_frames)
         return {
 
             "kind":
@@ -4609,12 +4500,6 @@ class LaneMapViewer(QWidget):
                 ) or {}
         }
 
-    def _topology_signature_from_timeline(
-            self,
-            timeline):
-
-        return []
-
     def build_semantic_timeline_database(self):
 
         if not self.openlabel_traj_map:
@@ -4648,7 +4533,7 @@ class LaneMapViewer(QWidget):
             # --------------------------------------------------
 
             vehicle_cache = {}
-
+            
             for oid in ids:
 
                 traj = self.openlabel_traj_map.get(oid)
@@ -4673,13 +4558,14 @@ class LaneMapViewer(QWidget):
                 }
 
             # --------------------------------------------------
-            # Vehicle contexts
+            # Vehicle contexts + semantic cache
             # --------------------------------------------------
 
+            vehicle_semantic_cache = {}
             vehicle_ctx_cache = self._openlabel_vehicle_ctx_cache
 
             progress_ctx = QProgressDialog(
-                "Precomputing vehicle contexts...",
+                "Precomputing vehicle semantics...",
                 "Cancel",
                 0,
                 len(ids),
@@ -4696,16 +4582,61 @@ class LaneMapViewer(QWidget):
                     return
 
                 try:
+
                     if oid not in vehicle_ctx_cache:
-                        builder_traj = self._traj_to_builder_format(
-                            vehicle_cache[oid]["traj"]
+
+                        builder_traj = (
+                            self._traj_to_builder_format(
+                                vehicle_cache[oid]["traj"]
+                            )
                         )
+
                         vehicle_ctx_cache[oid] = (
                             self._ctx_builder.build_vehicle_context(
                                 builder_traj
                             )
                         )
+
+                    veh_ctx = vehicle_ctx_cache[oid]
+
+                    semantic_ctx = (
+                        self._build_pair_scenario_context(
+                            actor_a_id=oid,
+                            actor_b_id=oid,
+                            ctx_a=veh_ctx,
+                            ctx_b=veh_ctx,
+                            pair={"timeline": {}},
+                            start_frame=vehicle_cache[oid]["first_frame"],
+                            end_frame=vehicle_cache[oid]["last_frame"]
+                        )
+                    )
+
+                    semantic_ctx["ready"] = True
+
+                    semantic_ctx = (
+                        self.build_semantic_context(
+                            semantic_ctx
+                        )
+                    )
+
+                    vehicle_semantic_cache[oid] = {
+                        "context": semantic_ctx,
+                        "descriptor":
+                            semantic_ctx
+                            .get("derived", {})
+                            .get(
+                                "scenario_descriptor",
+                                {}
+                            ),
+                        "events":
+                            semantic_ctx.get(
+                                "event_timeline",
+                                []
+                            )
+                    }
+
                 except Exception as e:
+
                     print(
                         f"[CTX CACHE] {oid}: {e}"
                     )
@@ -4737,51 +4668,19 @@ class LaneMapViewer(QWidget):
                 # ==================================================
 
                 for oid, veh in vehicle_cache.items():
-
                     try:
-
-                        ctx_single = {
-
-                            "ready": True,
-
-                            "vehicles": {
-                                "V1": vehicle_ctx_cache[oid],
-                                "V2": vehicle_ctx_cache[oid]
-                            },
-
-                            "pair": {
-                                "timeline": {}
-                            },
-
-                            "duration_seconds":
-                                max(
-                                    1.0,
-                                    veh["frame_count"]
-                                    /
-                                    max(self.fps, 1.0)
-                                ),
-
-                            "meta":
-                                getattr(
-                                    self.road,
-                                    "meta",
-                                    {}
-                                ) or {}
-                        }
-
-                        ctx_single = (
-                            self.build_semantic_context(
-                                ctx_single
-                            )
-                        )
-
+                        sem = vehicle_semantic_cache.get(oid)
+                        if sem is None:
+                            continue
+                        # Reuse the precomputed semantic context.
+                        ctx_single = sem["context"]
+                        seen = set()
                         events = []
 
                         for ev in ctx_single.get(
                             "event_timeline",
                             []
                         ):
-
                             participants = ev.get(
                                 "participants",
                                 []
@@ -4808,18 +4707,9 @@ class LaneMapViewer(QWidget):
                                 ev.get("from_region"),
                                 ev.get("to_region")
                             )
-
-                            if not hasattr(
-                                self,
-                                "_vehicle_event_seen"
-                            ):
-                                self._vehicle_event_seen = set()
-
-                            if key in self._vehicle_event_seen:
+                            if key in seen:
                                 continue
-
-                            self._vehicle_event_seen.add(key)
-
+                            seen.add(key)
                             events.append(ev)
 
                         event_sequence, event_transitions, stats = (
@@ -4827,9 +4717,8 @@ class LaneMapViewer(QWidget):
                                 events
                             )
                         )
-
+                        descriptor = sem["descriptor"]
                         track = {
-
                             "scope": "vehicle",
 
                             "actor_ids": [
@@ -4860,7 +4749,35 @@ class LaneMapViewer(QWidget):
                                         e["event"]
                                         for e in event_sequence
                                     }
+                                ),
+                            "rule_types":
+                                sorted(
+                                    set(
+                                        descriptor
+                                        .get(
+                                            "search_index",
+                                            {}
+                                        )
+                                        .get(
+                                            "rule_types",
+                                            []
+                                        )
+                                    )
+                                ),
+
+                            "descriptor":
+                                descriptor,                                
+                            "route_signatures": [
+                                tuple(
+                                    ctx_single["actors"]["A"]
+                                    ["route_semantics"]
+                                    ["transitions"]
                                 )
+                            ],
+
+                            "topology_facts":
+                                ctx_single["actors"]["A"]
+                                ["topology_facts"],                                
                         }
 
                         first_track = self._write_track(
@@ -4921,13 +4838,26 @@ class LaneMapViewer(QWidget):
                         if end_frame - start_frame < 50:
                             continue
 
-                        common = (
-                            v1["frame_keys"]
-                            &
-                            v2["frame_keys"]
+                        start_frame = max(
+                            v1["first_frame"],
+                            v2["first_frame"]
                         )
 
-                        if len(common) < 50:
+                        end_frame = min(
+                            v1["last_frame"],
+                            v2["last_frame"]
+                        )
+
+                        if end_frame <= start_frame:
+                            continue
+
+                        common_count = (
+                            end_frame -
+                            start_frame +
+                            1
+                        )
+
+                        if common_count < 50:
                             continue
 
                         # --------------------------------------
@@ -4965,18 +4895,43 @@ class LaneMapViewer(QWidget):
 
                             ctx_a = vehicle_ctx_cache[v1_id]
                             ctx_b = vehicle_ctx_cache[v2_id]
+                            veh1_events = (
+                                vehicle_semantic_cache
+                                [v1_id]
+                                ["events"]
+                            )
 
+                            veh2_events = (
+                                vehicle_semantic_cache
+                                [v2_id]
+                                ["events"]
+                            )
+
+                            if (
+                                len(veh1_events) == 0
+                                and
+                                len(veh2_events) == 0
+                            ):
+                                continue
                             tl1 = {
                                 k: v
                                 for k, v in ctx_a["timeline"].items()
-                                if k in common
+                                if start_frame <= k <= end_frame
                             }
 
                             tl2 = {
                                 k: v
                                 for k, v in ctx_b["timeline"].items()
-                                if k in common
+                                if start_frame <= k <= end_frame
                             }
+
+                            common = set(tl1) & set(tl2)
+
+                            if len(common) < 50:
+                                continue
+
+                            tl1 = {k: tl1[k] for k in common}
+                            tl2 = {k: tl2[k] for k in common}
 
                             pair = self._ctx_builder.build_pairwise(
                                 {"timeline": tl1},
@@ -4999,8 +4954,10 @@ class LaneMapViewer(QWidget):
 
                             ctx["ready"] = True
 
-                            ctx = self.build_semantic_context(
-                                ctx
+                            ctx = (
+                                self.build_semantic_context(
+                                    ctx
+                                )
                             )
 
                             events = (
@@ -5013,43 +4970,60 @@ class LaneMapViewer(QWidget):
                                     events
                                 )
                             )
-
+                            interaction_topology = (
+                                ctx.get(
+                                    "interaction_topology",
+                                    {}
+                                )
+                            )
                             if (
                                 not event_sequence
                                 and
-                                len(common) < 100
+                                not interaction_topology.get(
+                                    "common_merge_points"
+                                )
+                                and
+                                not interaction_topology.get(
+                                    "common_diverge_points"
+                                )
                             ):
                                 continue
 
-                            pair_ctx = self._build_pair_scenario_context(
-                                actor_a_id=v1_id,
-                                actor_b_id=v2_id,
-                                ctx_a={"timeline": tl1},
-                                ctx_b={"timeline": tl2},
-                                pair=pair,
-                                start_frame=start_frame,
-                                end_frame=end_frame
+                            actors = ctx.get(
+                                "actors",
+                                {}
                             )
 
                             actor_a_topology = (
-                                pair_ctx["actors"]
-                                        ["A"]
-                                        ["route_semantics"]
-                                        ["transitions"]
+                                actors.get(
+                                    "A",
+                                    {}
+                                )
+                                .get(
+                                    "route_semantics",
+                                    {}
+                                )
+                                .get(
+                                    "transitions",
+                                    []
+                                )
                             )
 
                             actor_b_topology = (
-                                pair_ctx["actors"]
-                                        ["B"]
-                                        ["route_semantics"]
-                                        ["transitions"]
+                                actors.get(
+                                    "B",
+                                    {}
+                                )
+                                .get(
+                                    "route_semantics",
+                                    {}
+                                )
+                                .get(
+                                    "transitions",
+                                    []
+                                )
                             )
 
-                            interaction_topology = (
-                                pair_ctx[
-                                    "interaction_topology"
-                                ]
-                            )
                             track = {
                                 "scope": "pair",
                                 "actor_ids": [
@@ -5062,16 +5036,15 @@ class LaneMapViewer(QWidget):
                                 "interaction_topology":
                                     interaction_topology,
 
-                                "topology_v1":
-                                    actor_a_topology,
+                                "route_signatures":
+                                    sorted([
+                                        tuple(actor_a_topology),
+                                        tuple(actor_b_topology)
+                                    ]),
 
-                                "topology_v2":
-                                    actor_b_topology,
-
-                                "topology_transitions":
-                                {
-                                    "V1": actor_a_topology,
-                                    "V2": actor_b_topology
+                                "topology_transitions": {
+                                    "A": actor_a_topology,
+                                    "B": actor_b_topology
                                 },
 
                                 "event_sequence":
@@ -5089,7 +5062,24 @@ class LaneMapViewer(QWidget):
                                             e["event"]
                                             for e in event_sequence
                                         )
+                                    ),
+                                "semantic_signature":
+                                    ctx.get(
+                                        "derived",
+                                        {}
                                     )
+                                    .get(
+                                        "scenario_descriptor",
+                                        {}
+                                    )
+                                    .get(
+                                        "search_index",
+                                        {}
+                                    )
+                                    .get(
+                                        "semantic_signature",
+                                        {}
+                                    ),                                    
                             }
 
 

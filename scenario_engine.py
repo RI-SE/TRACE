@@ -74,48 +74,6 @@ def _normalize_event_features(event):
 
     return event
 
-def build_path_descriptor(path, meta):
-
-    lanes = set()
-    overlaps = set()
-    junctions = set()
-
-    for rid in path:
-
-        entry = meta.get(str(rid), {})
-
-        if not isinstance(entry, dict):
-            continue
-
-        if entry.get("type") == "overlap":
-            overlaps.add(rid)
-
-            for m in entry.get("members", []) or []:
-                try:
-                    lanes.add(int(m))
-                except Exception:
-                    pass
-        else:
-            lanes.add(rid)
-
-        # direct junction reference
-        if entry.get("junction_id") is not None:
-            junctions.add(str(entry["junction_id"]))
-
-        # shared junction relationships observed in metadata
-        for field in (
-            "shares_upcoming_junction_with",
-            "shares_prev_junction_with"
-        ):
-            for j in entry.get(field, []) or []:
-                junctions.add(str(j))
-
-    return {
-        "lanes": lanes,
-        "overlaps": overlaps,
-        "junctions": junctions
-    }
-
 def get_reachable(start_nodes, graph, max_depth=3):
 
     visited = set()
@@ -272,18 +230,6 @@ def _extract_window_features(ctx, t_start, t_end, actor=None):
 # ============================================================
 # TOPOLOGY RESOLVER (ENGINE-ONLY SEMANTICS)
 # ============================================================
-
-def enrich_with_topology(ctx):
-    ctx.setdefault(
-        "route_semantics",
-        {}
-    )
-    ctx.setdefault(
-        "interaction_topology",
-        {}
-    )
-    return ctx
-
 
 
 def build_reachability_graph(meta: Dict[str, Any]) -> Dict[int, Set[int]]:
@@ -1012,10 +958,6 @@ def enrich_with_signal_metrics(ctx: dict) -> dict:
     lc_events_v1 = build_lane_change_events(ctx, v1_sd, v1_regions, "vehicle1")
     lc_events_v2 = build_lane_change_events(ctx, v2_sd, v2_regions, "vehicle2")
 
-    # --- assign cleanly ---
-    engine["lane_change_events"] = lc_events_v1 + lc_events_v2
-
-
     #  derive counts from events (SINGLE SOURCE OF TRUTH)
 
     ctx.setdefault(
@@ -1272,13 +1214,32 @@ def build_engine_insight_context(
 # Events 
 # ============================================================
 
+def detect_pair_events(ctx):
 
-def detect_events(ctx, events=None):
-    events = list(events) if events else []
-    e = ctx.get("derived", {}).get("engine", {})
+    events = []
 
-    lat_thr = cfg_get(ctx, "proximity_lat_dist", None)
-    dist_thr = cfg_get(ctx, "proximity_dist", float("inf"))
+    e = (
+        ctx.get("derived", {})
+           .get("engine", {})
+    )
+
+    pair_ts = e.get(
+        "pair_time_series",
+        []
+    )
+
+    lat_thr = cfg_get(
+        ctx,
+        "proximity_lat_dist",
+        None
+    )
+
+    dist_thr = cfg_get(
+        ctx,
+        "proximity_dist",
+        float("inf")
+    )
+
     enter_dist = cfg_get(
         ctx,
         "proximity_enter_dist",
@@ -1289,7 +1250,7 @@ def detect_events(ctx, events=None):
         ctx,
         "proximity_exit_dist",
         enter_dist + 0.5
-    )    
+    )
 
     min_event_duration = cfg_get(
         ctx,
@@ -1297,149 +1258,171 @@ def detect_events(ctx, events=None):
         0.0
     )
 
-    # -------------------------
-    # Lane change
-    # -------------------------
-    for lc in e.get("lane_change_events", []):
-        t0 = lc.get("t_start")
-        t1 = lc.get("t_end", t0)
-
-        if not isinstance(t0, (int, float)):
-            continue
-        if not isinstance(t1, (int, float)):
-            t1 = t0
-
-        features = _extract_window_features(ctx, t0, t1)
-        interaction = _derive_interaction_features(ctx, t0, t1)
-        events.append({
-            "type": "lane_change",
-            "participants": [lc.get("actor")],
-            "t_start": float(t0),
-            "t_end": float(t1),
-            "region": lc.get("region"),
-            "metrics": lc.get("metrics", {}),
-            "features": features,
-            "interaction": interaction
-        })
-
-    # --------------------------------------------------
-    # MERGED PROXIMITY EVENTS (segment-based)
-    # --------------------------------------------------
-    pair_ts = e.get("pair_time_series", [])
-
     active_start = None
     active_points = []
-
-    inside_event = False
 
     for p in pair_ts:
 
         d = p.get("dist")
         lat_d = p.get("lat_dist")
 
-        currently_active = inside_event
+        active = (
+            isinstance(d, (float, int))
+            and d <= enter_dist
+            and (
+                lat_thr is None
+                or lat_d <= lat_thr
+            )
+        )
 
-        if not isinstance(d, (int, float)):
-            currently_active = False
+        if active:
 
-        elif (
-            lat_thr is not None
-            and isinstance(lat_d, (int, float))
-            and lat_d > lat_thr
-        ):
-            currently_active = False
+            if active_start is None:
+                active_start = p["t"]
+
+            active_points.append(p)
 
         else:
 
-            if not inside_event:
+            if active_start is not None:
 
-                if d <= enter_dist:
-                    currently_active = True
+                t0 = active_start
+                t1 = active_points[-1]["t"]
 
-            else:
+                if (
+                    t1 - t0
+                    >= min_event_duration
+                ):
+                    events.append({
+                        "type": "proximity",
+                        "participants": [
+                            "vehicle1",
+                            "vehicle2"
+                        ],
+                        "t_start": t0,
+                        "t_end": t1,
+                        "metrics": {},
+                        "features":
+                            _extract_window_features(
+                                ctx,
+                                t0,
+                                t1
+                            ),
+                        "interaction":
+                            _derive_interaction_features(
+                                ctx,
+                                t0,
+                                t1
+                            )
+                    })
 
-                if d > exit_dist:
-                    currently_active = False
-
-        # ------------------------------------
-        # segment closed
-        # ------------------------------------
-        if inside_event and not currently_active:
-
-            t0 = active_start
-            t1 = active_points[-1]["t"]
-
-            features = _extract_window_features(
-                ctx,
-                t0,
-                t1
-            )
-
-            interaction = _derive_interaction_features(
-                ctx,
-                t0,
-                t1
-            )
-
-            if (t1 - t0) >= min_event_duration:
-
-                events.append({
-                    "type": "proximity",
-                    "participants": [
-                        "vehicle1",
-                        "vehicle2"
-                    ],
-                    "t_start": float(t0),
-                    "t_end": float(t1),
-                    "metrics": {},
-                    "features": features,
-                    "interaction": interaction
-                })
-
-            active_start = None
-            active_points = []
-
-        # ------------------------------------
-        # segment started
-        # ------------------------------------
-        if not inside_event and currently_active:
-
-            active_start = p["t"]
-            active_points = []
-
-        if currently_active:
-            active_points.append(p)
-
-        inside_event = currently_active
-
-
-    # close last segment
-    if active_start is not None and active_points:
-        t0 = active_start
-        t1 = active_points[-1]["t"]
-
-        features = _extract_window_features(ctx, t0, t1)
-        interaction = _derive_interaction_features(ctx, t0, t1)
-        if (t1 - t0) >= min_event_duration:
-            events.append({
-                "type": "proximity",
-                "participants": ["vehicle1", "vehicle2"],
-                "t_start": float(t0),
-                "t_end": float(t1),
-                "metrics": {},
-                "features": features,
-                "interaction": interaction
-            })
-    waiting_events = build_waiting_events(ctx)
-
-    if waiting_events:
-        events.extend(waiting_events)
-
+                active_start = None
+                active_points = []
 
     return events
 
+def detect_events(
+    ctx,
+    vehicle_states=None
+):
+    """
+    Event assembly layer.
 
+    Vehicle-specific semantics come from VehicleSemanticState.
 
+    Pair-specific semantics come from detect_pair_events().
+
+    This avoids recomputing waiting/lane-change events
+    for every indexed pair.
+    """
+
+    assembled = []
+
+    # --------------------------------------------------
+    # Fast path: precomputed vehicle semantics
+    # --------------------------------------------------
+
+    if vehicle_states:
+
+        for state in vehicle_states.values():
+
+            assembled.extend(
+                state.event_timeline
+            )
+
+    else:
+
+        # backward-compatible runtime path
+
+        engine = (
+            ctx.get("derived", {})
+               .get("engine", {})
+        )
+
+        for lc in engine.get(
+            "lane_change_events",
+            []
+        ):
+
+            t0 = lc.get("t_start")
+            t1 = lc.get("t_end", t0)
+
+            if not isinstance(
+                t0,
+                (int, float)
+            ):
+                continue
+
+            if not isinstance(
+                t1,
+                (int, float)
+            ):
+                t1 = t0
+
+            assembled.append({
+                "type": "lane_change",
+                "participants": [
+                    lc.get("actor")
+                ],
+                "t_start": float(t0),
+                "t_end": float(t1),
+                "region": lc.get("region"),
+                "metrics": lc.get(
+                    "metrics",
+                    {}
+                ),
+                "features": _extract_window_features(
+                    ctx,
+                    t0,
+                    t1
+                ),
+                "interaction": _derive_interaction_features(
+                    ctx,
+                    t0,
+                    t1
+                )
+            })
+
+        assembled.extend(
+            build_waiting_events(ctx)
+        )
+
+    # --------------------------------------------------
+    # Pair interaction events
+    # --------------------------------------------------
+
+    assembled.extend(
+        detect_pair_events(ctx)
+    )
+
+    assembled.sort(
+        key=lambda e: (
+            e.get("t_start", 0.0),
+            e.get("t_end", 0.0)
+        )
+    )
+
+    return assembled
 
 # ============================================================
 # EVENTS
@@ -1683,7 +1666,6 @@ class TemporalGraphMatcher:
 # ============================================================
 
 
-
 def _to_namespace(obj):
 
     if isinstance(obj, dict):
@@ -1709,102 +1691,64 @@ def _normalize_expr(expr: str) -> str:
             .replace("== false", "== False")
     )
 
+# ------------------------------------------------------------
+# Expression compilation + namespace caches
+# ------------------------------------------------------------
+_COMPILED_EXPR: dict[str, Any] = {}
+
+
+def _compiled_expr(expr: str):
+    key = _normalize_expr(expr)
+    code = _COMPILED_EXPR.get(key)
+    if code is None:
+        code = compile(key, "<gorules>", "eval")
+        _COMPILED_EXPR[key] = code
+    return code
+
+
+def _build_eval_ns(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a raw context to an eval-ready namespace.
+
+    Call this ONCE per event, not once per expression node:
+    it recursively walks the whole context.
+    """
+    ns = {
+        str(k): _to_namespace(v)
+        for k, v in ctx.items()
+        if isinstance(k, str)
+    }
+    ns["min"] = min
+    ns["max"] = max
+    ns["abs"] = abs
+    ns["math"] = math
+    return ns
+
+
+def _eval_compiled(code, ns):
+    return eval(code, {"__builtins__": {}}, ns)
+
+
 def eval_value(expr: str, ctx: Dict[str, Any]):
     if not expr:
         return None
 
-    expr = _normalize_expr(expr)
-
     try:
-        # only allow string keys
-        safe_ctx = {
-            str(k): _to_namespace(v)
-            for k, v in ctx.items()
-            if isinstance(k, str)
-        }
-
-        locals_dict = dict(safe_ctx)
-
-        locals_dict["min"] = min
-        locals_dict["max"] = max
-        locals_dict["abs"] = abs
-        locals_dict["math"] = math
-
-        return eval(
-            expr,
-            {"__builtins__": {}},
-            locals_dict
-        )
+        return _eval_compiled(_compiled_expr(expr), _build_eval_ns(ctx))
 
     except AttributeError:
-        return 0.0    
+        return 0.0
 
-    except Exception as e:
-        print("\n[EVAL_VALUE ERROR]")
-        print("expr =", expr)
-        print("error =", repr(e))
-
-        try:
-            print("ctx keys =", list(ctx.keys()))
-        except Exception:
-            pass
-
-        return None
 
 def eval_expr(expr: str, ctx: Dict[str, Any]) -> bool:
     if not expr:
         return False
 
-    expr = _normalize_expr(expr)
-
     try:
-        # only allow string keys
-        safe_ctx = {
-            str(k): _to_namespace(v)
-            for k, v in ctx.items()
-            if isinstance(k, str)
-        }
+        return bool(_eval_compiled(_compiled_expr(expr), _build_eval_ns(ctx)))
 
-        locals_dict = dict(safe_ctx)
-
-        locals_dict["min"] = min
-        locals_dict["max"] = max
-        locals_dict["abs"] = abs
-        locals_dict["math"] = math
-
-
-        bad_keys = [
-            (k, type(k))
-            for k in ctx.keys()
-            if not isinstance(k, str)
-        ]
-
-        if bad_keys:
-            print("[BAD CTX KEYS]", bad_keys)
-
-
-        result = eval(
-            expr,
-            {"__builtins__": {}},
-            locals_dict
-        )
-
-        return bool(result)
-    
     except AttributeError:
         return False
 
-    except Exception as e:
-        print("\n[EVAL_EXPR ERROR]")
-        print("expr =", expr)
-        print("error =", repr(e))
-
-        try:
-            print("ctx keys =", list(ctx.keys()))
-        except Exception:
-            pass
-
-        return False
 
 
 # ------------------------------------------------------------
@@ -1824,7 +1768,29 @@ def resolve_value(val, ctx):
 class GoRulesEngine:
 
     def __init__(self, model: Dict[str, Any]):
-        self.nodes = model.get("decision", {}).get("nodes", [])
+        decision = model.get(
+            "decision",
+            {}
+        )
+
+        self.nodes = decision.get(
+            "nodes",
+            []
+        )
+
+        self.rule_scope = decision.get(
+            "rule_scope",
+            {}
+        )
+        self.expression_nodes = [
+            n for n in self.nodes if n.get("type") == "expression"
+        ]
+
+        self.decision_nodes = [
+            n for n in self.nodes if n.get("type") == "decision"
+        ]
+
+
 
     def evaluate(self, ctx: Dict[str, Any]) -> List:
         results = []
@@ -1832,8 +1798,18 @@ class GoRulesEngine:
         events = ctx.get("event_timeline", [])
 
         for event in events:
+            participants = event.get(
+                "participants"
+            )
 
-            actor_id = event.get("participants", ["both"])[0]
+            if participants:
+                actor_id = participants[0]
+
+            elif event.get("actor"):
+                actor_id = event["actor"]
+
+            else:
+                actor_id = "both"
 
             if actor_id == "vehicle1":
                 lane_shift_count = (
@@ -1894,38 +1870,49 @@ class GoRulesEngine:
                 **event.get("features", {}),
                 **(event.get("interaction") or {})
             }
+            ns = _build_eval_ns(local_ctx)
 
             # ---------------------------------
             # PASS 1 : expression nodes
             # ---------------------------------
-            for node in self.nodes:
-
-                if node.get("type") != "expression":
-                    continue
+            for node in self.expression_nodes:
 
                 expr_id = node.get("id")
                 expr = node.get("expr")
 
-                if expr_id:
-                    result = eval_value(expr, local_ctx)
-                    if result is None:
-                        result = 0.0
-                    local_ctx[expr_id] = result
+                if not expr_id or not expr:
+                    continue
+
+                try:
+                    result = _eval_compiled(_compiled_expr(expr), ns)
+                except AttributeError:
+                    result = 0.0
+                except Exception:
+                    result = None
+
+                if result is None:
+                    result = 0.0
+
+                ns[expr_id] = result
+
 
 
             # ---------------------------------
             # PASS 2 : decision nodes
             # ---------------------------------
-            for node in self.nodes:
-
-                if node.get("type") != "decision":
-                    continue
+            for node in self.decision_nodes:
 
                 for cond in node.get("conditions", []):
                     condition = cond.get("if")
-                    result = eval_expr(condition, local_ctx)
+                    try:
+                        result = bool(_eval_compiled(_compiled_expr(condition), ns))
+                    except AttributeError:
+                        result = False
+                    except Exception:
+                        result = False
                     if not result:
                         continue
+
 
                     out = cond.get("then", {})
 
@@ -1950,11 +1937,19 @@ class GoRulesEngine:
                         or out.get("behavior", {}).get("type")
                         or node.get("id")
                     )
-
+                    scope = self.rule_scope.get(
+                        subtype
+                    )
+                    if scope == "vehicle":
+                        final_actor = actor_id
+                    elif scope == "pair":
+                        final_actor = "both"
+                    else:
+                        final_actor = actor_id                    
                     results.append(
                         RuleEntry(
                             type="gorules_event",
-                            actor=actor_id,
+                            actor=final_actor,
                             confidence=conf,
                             parameters={
                                 "subtype": subtype,
@@ -1971,6 +1966,34 @@ class GoRulesEngine:
 
         return results
 
+def _compute_min_positive_ttc(
+        pair_timeline):
+
+    values = []
+
+    for frame in pair_timeline.values():
+
+        ttc = frame.get("ttc_s")
+
+        if not isinstance(
+            ttc,
+            (int, float)
+        ):
+            continue
+
+        if (
+            math.isfinite(ttc)
+            and
+            0 < ttc < 60
+        ):
+            values.append(ttc)
+
+    return (
+        min(values)
+        if values
+        else float("inf")
+    )
+
 def _derive_rule_inputs(ctx: dict) -> dict:
     """
     Pure feature extraction for GoRules.
@@ -1979,36 +2002,26 @@ def _derive_rule_inputs(ctx: dict) -> dict:
     No rule decisions.
     """
 
-    meta = ctx.get("meta") or {}
-    vehicles = ctx.get("vehicles") or {}
     engine = ctx.get("derived", {}).get("engine", {})
 
     # --------------------------------------------------
     # Pair timeline metrics
     # --------------------------------------------------
     pair_tl = (
-        ctx.get("pairwise", {}).get("timeline")
-        or {}
+        ctx.get(
+            "interaction_facts",
+            {}
+        ).get(
+            "timeline",
+            {}
+        )
     )
 
-    ttc_values = []
-    if isinstance(pair_tl, dict):
-        for frame in pair_tl.values():
-            ttc = frame.get("ttc_s")
-            if not isinstance(
-                ttc,
-                (int, float)
-            ):
-                continue
-            if not math.isfinite(ttc):
-                continue
-            if ttc <= 0:
-                continue
-            if ttc > 60:
-                continue
-            ttc_values.append(
-                float(ttc)
-            )
+    min_ttc = (
+        _compute_min_positive_ttc(
+            pair_tl
+        )
+    )
 
     interaction_topology = (
         ctx.get(
@@ -2068,10 +2081,7 @@ def _derive_rule_inputs(ctx: dict) -> dict:
                 )
             ),
 
-        "min_ttc":
-            min(ttc_values)
-            if ttc_values
-            else float("inf")
+        "min_ttc": min_ttc
     }
 
 
@@ -2202,8 +2212,13 @@ def _derive_rule_inputs(ctx: dict) -> dict:
     out["distance_trend"] = distance_trend
     out["separation_after_event"] = max(distance_trend, 0.0)
     interaction = (
-        _derive_interaction_features(
-            ctx
+        ctx.get(
+            "derived",
+            {}
+        )
+        .get(
+            "interaction_features",
+            {}
         )
     )
 
@@ -2417,7 +2432,205 @@ def _derive_interaction_features(
 
     return result
 
+@dataclass
+class VehicleSemanticState:
+    actor_id: str
+    route_signature: list
+    topology_facts: dict
+    waiting_events: list
+    lane_change_events: list
+    maneuver_timeline: list
+    event_timeline: list
+    search_tokens: list
+    descriptor_fragment: dict
 
+def build_vehicle_maneuvers(
+    actor_id,
+    route_signature,
+    waiting_events,
+    lane_change_events,
+    topology_facts
+):
+
+    maneuvers = []
+
+    for e in waiting_events:
+
+        maneuvers.append({
+            "type": "standstill",
+            "t_start": e["t_start"],
+            "t_end": e["t_end"],
+            "domain": "longitudinal"
+        })
+
+        maneuvers.append({
+            "type": "waiting",
+            "t_start": e["t_start"],
+            "t_end": e["t_end"],
+            "domain": "longitudinal"
+        })
+
+    for e in lane_change_events:
+
+        from_lane = (
+            e.get("metrics", {})
+             .get("from_lane")
+        )
+
+        to_lane = (
+            e.get("metrics", {})
+             .get("to_lane")
+        )
+
+        maneuvers.append({
+            "type": "lane_change",
+            "t_start": e["t_start"],
+            "t_end": e["t_end"],
+            "domain": "lateral",
+            "from_lane": from_lane,
+            "to_lane": to_lane
+        })
+
+    merges = topology_facts.get(
+        "merge_points",
+        []
+    )
+
+    diverges = topology_facts.get(
+        "diverge_points",
+        []
+    )
+
+    for _ in merges:
+
+        maneuvers.append({
+            "type": "merge_preparation",
+            "domain": "topology"
+        })
+
+    for _ in diverges:
+
+        maneuvers.append({
+            "type": "diverge_navigation",
+            "domain": "topology"
+        })
+
+    maneuvers.sort(
+        key=lambda m: (
+            m.get("t_start", 0.0)
+        )
+    )
+
+    return maneuvers
+
+def build_vehicle_semantics(ctx):
+
+    engine = (
+        ctx.get("derived", {})
+           .get("engine", {})
+    )
+
+    result = {}
+
+    actor_specs = [
+        ("vehicle1", "A", engine.get("v1_sd", [])),
+        ("vehicle2", "B", engine.get("v2_sd", []))
+    ]
+
+    for actor_name, actor_key, sd in actor_specs:
+
+        actor_ctx = (
+            ctx.get("actors", {})
+               .get(actor_key, {})
+        )
+
+        timeline = actor_ctx.get(
+            "timeline",
+            {}
+        )
+
+        regions = [
+            f.get("region_id")
+            for _, f in sorted(
+                timeline.items(),
+                key=lambda x: int(x[0])
+            )
+        ]
+
+        local_ctx = {
+            **ctx,
+            "derived": {
+                **ctx["derived"],
+                "engine": {
+                    **engine,
+                    "v1_sd": sd,
+                    "v2_sd": []
+                }
+            }
+        }
+
+        waiting_events = build_waiting_events(
+            local_ctx
+        )
+
+        lane_change_events = (
+            build_lane_change_events(
+                ctx,
+                sd,
+                regions,
+                actor_name
+            )
+        )
+
+        topology_facts = actor_ctx.get(
+            "topology_facts",
+            {}
+        )
+
+        route_signature = (
+            actor_ctx
+            .get(
+                "route_semantics",
+                {}
+            )
+            .get(
+                "transitions",
+                []
+            )
+        )
+
+        maneuvers = build_vehicle_maneuvers(
+            actor_name,
+            route_signature,
+            waiting_events,
+            lane_change_events,
+            topology_facts
+        )
+
+        result[actor_name] = VehicleSemanticState(
+            actor_id=actor_name,
+            route_signature=route_signature,
+            topology_facts=topology_facts,
+            waiting_events=waiting_events,
+            lane_change_events=lane_change_events,
+            maneuver_timeline=maneuvers,
+            event_timeline=(
+                waiting_events +
+                lane_change_events
+            ),
+            search_tokens=[
+                m["type"]
+                for m in maneuvers
+            ],
+            descriptor_fragment={
+                "maneuver_chain": [
+                    m["type"]
+                    for m in maneuvers
+                ]
+            }
+        )
+
+    return result
 
 # ============================================================
 # MAIN ENTRY
@@ -2439,13 +2652,35 @@ def suggest_rules_combined(
 
     templates = load_templates(templates_path)
 
-    ctx = copy.deepcopy(context)
+    ctx = {
+        **context,
+        "derived": {
+            **context.get(
+                "derived",
+                {}
+            )
+        }
+    }
     ctx["config"] = templates.get("config", {})
 
-    ctx.setdefault("vehicles", {})
-    ctx.setdefault("pairwise", {})
     ctx.setdefault("derived", {})
+    vehicle_states = (
+        ctx["derived"].get(
+            "vehicle_semantics"
+        )
+    )
 
+    if vehicle_states is None:
+
+        vehicle_states = (
+            build_vehicle_semantics(
+                ctx
+            )
+        )
+
+        ctx["derived"][
+            "vehicle_semantics"
+        ] = vehicle_states
     ctx["duration_seconds"] = float(duration) if duration > 0 else 0.0
 
     if meta is not None:
@@ -2454,20 +2689,14 @@ def suggest_rules_combined(
     # ----------------------------------------------------------
     # 2. TOPOLOGY ENRICHMENT
     # ----------------------------------------------------------
-    ctx = enrich_with_signal_metrics(ctx)
+    if (
+        "engine" not in ctx.get("derived", {})
+        or
+        "pair_time_series"
+        not in ctx["derived"].get("engine", {})
+    ):
+        ctx = enrich_with_signal_metrics(ctx)    
     engine = ctx.get("derived", {}).get("engine", {})
-
-    print(
-        "[DEBUG]",
-        "pair_ts=",
-        len(engine.get("pair_time_series", [])),
-        "lane_changes=",
-        len(engine.get("lane_change_events", []))
-    )    
-    try:
-        ctx = enrich_with_topology(ctx)
-    except Exception:
-        pass
 
     # ----------------------------------------------------------
     # 3. SIGNAL + FEATURE BUILD (UNCHANGED CORE)
@@ -2477,15 +2706,24 @@ def suggest_rules_combined(
     # -------------------------
     # Interaction features
     # -------------------------
-    rule_inputs = _derive_rule_inputs(ctx)
-    ctx.setdefault("derived", {})["rule_inputs"] = rule_inputs
-    ctx.update(rule_inputs)
-
-    interaction = _derive_interaction_features(ctx)
-    ctx.setdefault("derived",{})
-    ctx["derived"]["interaction_features"] = interaction
-
+    interaction = (
+        _derive_interaction_features(
+            ctx
+        )
+    )
+    ctx["derived"][
+        "interaction_features"
+    ] = interaction
     ctx.update(interaction)
+    rule_inputs = (
+        _derive_rule_inputs(
+            ctx
+        )
+    )
+    ctx["derived"][
+        "rule_inputs"
+    ] = rule_inputs
+    ctx.update(rule_inputs)
     # -------------------------
     # Behavioral probabilities
     # -------------------------
@@ -2499,7 +2737,7 @@ def suggest_rules_combined(
     # ----------------------------------------------------------
     # 4. EVENT GENERATION (timeline-first)
     # ----------------------------------------------------------
-    ctx["events"] = detect_events(ctx)
+    ctx["events"] = detect_events(ctx, vehicle_states)
 
     ctx["engine_event_fingerprint"] = {
         "event_count":
@@ -2530,10 +2768,6 @@ def suggest_rules_combined(
             )
     }
 
-    print(
-        "[DEBUG EVENTS]",
-        len(ctx["events"])
-    )    
     ctx["event_timeline"] = _build_event_timeline(ctx)
     ctx["_canonical_event_timeline"] = copy.deepcopy(ctx["event_timeline"])
     ctx["semantic_event_timeline"] = copy.deepcopy(ctx["event_timeline"])
@@ -2563,8 +2797,12 @@ def suggest_rules_combined(
     engine = ctx.get("derived", {}).get("engine", {})
 
     ctx.update(signals)
-    ctx["pair_time_series"] = engine.get("pair_time_series", [])
-    ctx["lane_change_events"] = engine.get("lane_change_events", [])
+    ctx["interaction_time_series"] = (
+        engine.get(
+            "pair_time_series",
+            []
+        )
+    )
 
     # ----------------------------------------------------------
     # 7. INSTABILITY SIGNALS
@@ -2908,7 +3146,7 @@ def build_scenario_embedding(
         "proximity_count",
         "min_distance",
         "avg_closing_rate",
-        "same_lane_fraction",
+        "shared_lane_fraction",
     ]
 
     for key in numeric_keys:
@@ -2949,6 +3187,20 @@ def embedding_similarity(v1, v2):
     except Exception:
         return 0.0
 
+def _route_signature(
+        actor):
+
+    return (
+        actor
+        .get(
+            "route_semantics",
+            {}
+        )
+        .get(
+            "transitions",
+            []
+        )
+    )
 
 def build_scenario_descriptor(
         ctx: dict,
@@ -3063,61 +3315,38 @@ def build_scenario_descriptor(
         if not etype:
             continue
 
-        participants = (
-            evt.get(
-                "participants",
-                []
-            )
+        participants = evt.get(
+            "participants",
+            []
         )
 
         if len(participants) >= 2:
 
-            role = "AB"
-
-        elif len(participants) == 1:
-
-            role = "ONE"
+            actor_event_chain.append(
+                f"AB:{etype}"
+            )
 
         else:
 
-            role = "UNK"
-
-        actor_event_chain.append(
-            f"{role}:{etype}"
-        )
-
+            actor_event_chain.append(
+                f"ONE:{etype}"
+            )
     actors = ctx.get(
         "actors",
         {}
     )
 
-    topo_a = (
+    topo_a = _route_signature(
         actors.get(
             "A",
             {}
         )
-        .get(
-            "route_semantics",
-            {}
-        )
-        .get(
-            "transitions",
-            []
-        )
     )
 
-    topo_b = (
+    topo_b = _route_signature(
         actors.get(
             "B",
             {}
-        )
-        .get(
-            "route_semantics",
-            {}
-        )
-        .get(
-            "transitions",
-            []
         )
     )
 
@@ -3134,16 +3363,18 @@ def build_scenario_descriptor(
     topology = {
 
         "shared_lane_fraction":
-            it.get(
-                "shared_lane_ratio",
-                0.0
+            float(
+                it.get(
+                    "shared_lane_ratio",
+                    0.0
+                )
             ),
 
         "shared_junction_count":
-            len(
+            int(
                 it.get(
-                    "shared_junctions",
-                    []
+                    "shared_junction_count",
+                    0
                 )
             ),
 
@@ -3163,7 +3394,7 @@ def build_scenario_descriptor(
                 )
             ),
 
-        "shared_route_segments":
+        "shared_route_segment_count":
             len(
                 it.get(
                     "shared_route_segments",
@@ -3302,11 +3533,13 @@ def build_scenario_descriptor(
         "event_chain":
             tuple(actor_event_chain),
 
-        "route_signature_A":
-            tuple(topo_a),
-
-        "route_signature_B":
-            tuple(topo_b),
+        "route_signatures":
+            tuple(
+                sorted([
+                    tuple(topo_a),
+                    tuple(topo_b)
+                ])
+            ),
 
         "event_types":
             sorted(
@@ -3328,6 +3561,7 @@ def build_scenario_descriptor(
                 set(motifs)
             )
     }
+
 
     descriptor = {
 
