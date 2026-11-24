@@ -495,7 +495,7 @@ class ScenarioRuleGUI(QWidget):
         self._populate_insights_table(final_ctx)
         label = self._derive_scenario_label(final_ctx)
         self.setWindowTitle(f"TRACE Scenario — {label}")
-        self.btn_explain.setEnabled(bool(self._rules))
+        self.btn_explain.setEnabled(bool(self._engine_context))
         QMessageBox.information(self, "Done", "Rules generated successfully.")
 
     def _attach_event_timing(self, rules, ctx):
@@ -569,12 +569,6 @@ class ScenarioRuleGUI(QWidget):
                         region = v1_sd[idx].get("region_id")
                 if region is None:
                     region = "unknown"
-                if region is None and v1_sd and isinstance(params["start_t"], (int, float)):
-                    idx = min(
-                        range(len(v1_sd)),
-                        key=lambda i: abs(v1_sd[i]["t"] - params["start_t"])
-                    )
-                    region = v1_sd[idx].get("region_id")
                 params["region"] = region
                 if best_event.get("type") == "lane_change":
                     metrics = best_event.get("metrics", {})
@@ -928,10 +922,11 @@ class ScenarioRuleGUI(QWidget):
 
         add(
             "shared_lane_fraction",
-            interaction_topology.get(
-                "shared_lane_ratio"
+            (derived.get("rule_inputs") or {}).get(
+                "shared_lane_fraction"
             )
         )
+
 
         add(
             "shared_junction_count",
@@ -1208,17 +1203,22 @@ class ScenarioRuleGUI(QWidget):
             )
 
     def explain_rules(self):
-        if not self._rules:
-            QMessageBox.information(self, "Explain Rules", "No rules to explain. Generate rules first.")
+        if not self._engine_context:
+            QMessageBox.information(
+                self,
+                "Explain Rules",
+                "No scenario context yet. Apply a scenario first."
+            )
             return
 
         payload = {
             "derived_rules": self._rules,
-            "context": getattr(self, "_engine_context", self._engine_context) or {},
+            "context": self._engine_context or {},
             "options": {
                 "only_fired": self.chk_explain_only_fired.isChecked()
             }
         }
+
         try:
             text = self._explainer.explain(payload)
             QMessageBox.information(self, "Scenario Explanation", text)
