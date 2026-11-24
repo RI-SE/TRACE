@@ -20,6 +20,7 @@ from scenario_engine import (
     ScenarioRules,
     build_engine_insight_context,
     suggest_rules_combined,
+    sanitize_for_json
 )
 from signal_engine import validate_context
 
@@ -843,9 +844,8 @@ class ScenarioRuleGUI(QWidget):
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
-                # SafeJSONEncoder: engine context contains inf/nan and numpy types.
-                json.dump(self._engine_context, f, indent=2, ensure_ascii=False,
-                          cls=SafeJSONEncoder)
+                json.dump(sanitize_for_json(self._engine_context), f,
+                          indent=2, ensure_ascii=False, allow_nan=False)
             QMessageBox.information(self, "Export Insights", f"Saved insights to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Insights", f"Failed to write insights: {e}")

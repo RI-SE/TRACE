@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Set
 
 import numpy as np
-
+import os
 
 # ============================================================
 # Utilities
@@ -68,6 +68,16 @@ class SafeJSONEncoder(json.JSONEncoder):
             return list(obj)
         return super().default(obj)
 
+def sanitize_for_json(obj):
+    """Recursively replace non-finite floats with None (strict-JSON-safe)."""
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
 
 def sanitize_ttc(ttc):
     if ttc is None:
@@ -80,8 +90,15 @@ def sanitize_ttc(ttc):
 
 
 def load_templates(path="scenario_gorules.json") -> dict:
+    # CWD first (back-compat); fall back to the copy next to this module so
+    # the app works from any working directory.
+    if not os.path.isabs(path) and not os.path.exists(path):
+        alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        if os.path.exists(alt):
+            path = alt
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 
 # ============================================================
@@ -142,8 +159,8 @@ class ScenarioRules:
 
     def save_json(self, path):
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, cls=SafeJSONEncoder)
-
+            json.dump(sanitize_for_json(self.to_dict()), f, indent=2,
+                      cls=SafeJSONEncoder, allow_nan=False)
 
 @dataclass
 class VehicleSemanticState:
@@ -697,6 +714,7 @@ def build_lane_change_events(ctx: dict, v_sd: list, regions: list, actor: str):
                 events.append({
                     "type": "lane_change",
                     "actor": actor,
+                    "participants": [actor],   # M9: keep actor in search tokens
                     "t_start": t_start,
                     "t_end": t_end,
                     "region": from_lane,
@@ -753,8 +771,21 @@ def detect_pair_events(ctx):
                 })
             active_start = None
             last_t = None
-    # NOTE: an episode still active at the end of the sequence is not emitted.
+    # M11: flush an episode still active at the end of the sequence
+    if active_start is not None:
+        t0, t1 = active_start, last_t
+        if t1 - t0 >= min_event_duration:
+            events.append({
+                "type": "proximity",
+                "participants": ["vehicle1", "vehicle2"],
+                "t_start": t0,
+                "t_end": t1,
+                "metrics": {},
+                "features": _extract_window_features(ctx, t0, t1),
+                "interaction": _derive_interaction_features(ctx, t0, t1),
+            })
     return events
+
 
 
 def detect_events(ctx, vehicle_states=None):
@@ -1324,6 +1355,20 @@ def _route_signature(actor):
     return actor.get("route_semantics", {}).get("transitions", [])
 
 
+# Rule subtypes normalized to the canonical names the motif vocabulary is
+# defined over (waiting / merge / yield / near_miss_* / avoidance).
+_MOTIF_FAMILY = {
+    "waiting_for_gap": "waiting",
+    "waiting_for_merge_gap": "waiting",
+    "gap_acceptance": "waiting",
+    "merge": "merge",
+    "yield": "yield",
+    "near_miss_longitudinal": "near_miss_longitudinal",
+    "near_miss_lateral": "near_miss_lateral",
+    "avoidance": "avoidance",
+}
+
+
 def build_scenario_descriptor(ctx: dict, rules: list):
     timeline = sorted(
         ctx.get("_canonical_event_timeline", ctx.get("event_timeline", [])),
@@ -1376,14 +1421,46 @@ def build_scenario_descriptor(ctx: dict, rules: list):
                  + " || " + " → ".join(actor_event_chain))
 
     transitions = [f"{a}>{b}" for a, b in zip(actor_event_chain[:-1], actor_event_chain[1:])]
+
+    # Motifs: the vocabulary references rule subtypes (merge/yield/near_miss/
+    # avoidance), so the chain must mix detector events AND rules, sorted by
+    # time. (Old code took bigrams of the raw event chain only, where those
+    # subtypes never occur -> motifs were always empty.)
+    steps = []
+    for evt in timeline:
+        t0 = evt.get("t_start")
+        if not isinstance(t0, (int, float)):
+            continue
+        etype = evt.get("type")
+        if etype == "waiting":
+            steps.append((float(t0), "ONE:waiting"))
+        elif etype == "proximity":
+            steps.append((float(t0), "AB:proximity"))
+    for r in rules:
+        p = r.parameters or {}
+        subtype = str(p.get("subtype") or "")
+        fam = _MOTIF_FAMILY.get(subtype, subtype)
+        t0 = p.get("start_t")
+        token = f"{'AB' if r.actor == 'both' else 'ONE'}:{fam}"
+        if isinstance(t0, (int, float)):
+            steps.append((float(t0), token))
+    steps.sort(key=lambda x: x[0])
+
     motif_map = {
         "ONE:waiting>AB:merge": "WAIT_MERGE",
+        "AB:waiting>AB:merge": "WAIT_MERGE",
         "ONE:waiting>AB:yield": "WAIT_YIELD",
-        "AB:proximity>near_miss_longitudinal": "PROX_NEAR_MISS",
-        "AB:proximity>near_miss_lateral": "PROX_NEAR_MISS",
-        "AB:proximity>avoidance": "PROX_AVOIDANCE",
+        "AB:waiting>AB:yield": "WAIT_YIELD",
+        "AB:proximity>AB:near_miss_longitudinal": "PROX_NEAR_MISS",
+        "AB:proximity>AB:near_miss_lateral": "PROX_NEAR_MISS",
+        "AB:proximity>AB:avoidance": "PROX_AVOIDANCE",
     }
-    motifs = [motif_map[t] for t in transitions if t in motif_map]
+    chain_tokens = [s[1] for s in steps]
+    motifs = [
+        motif_map[f"{a}>{b}"]
+        for a, b in zip(chain_tokens[:-1], chain_tokens[1:])
+        if f"{a}>{b}" in motif_map
+    ]
 
     fingerprint = {
         "event_chain": actor_event_chain,
@@ -1433,6 +1510,7 @@ def build_scenario_descriptor(ctx: dict, rules: list):
         timeline, rules, topology, numeric_features, descriptor["search_index"])
     descriptor["embedding_version"] = "semantic_v3"
     return descriptor
+
 
 
 # ============================================================

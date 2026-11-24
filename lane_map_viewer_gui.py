@@ -23,6 +23,7 @@ from scenario_engine import (
     build_searchable_event_sequence,
     build_scenario_descriptor,
     suggest_rules_combined,
+    sanitize_for_json 
 )
 from road_infrastructure import RoadInfrastructure
 from signal_engine import (
@@ -1485,6 +1486,31 @@ class LaneMapViewer(QWidget):
             ctx.setdefault("derived", {})["scenario_descriptor"] = build_scenario_descriptor(ctx, rules)
         return ctx
 
+    def _stamp_frame_times(self, ctx):
+        """Give every actor frame a real 't' in seconds.
+
+        Without this, scenario_engine.extract_sd_sequences falls back to
+        t = frame_index * default_frame_dt (0.1 s), which only matches real
+        time at 10 FPS - event times, durations and speeds were all scaled
+        by that assumption.
+        """
+        fps = float(self.fps or 0.0)
+        if not math.isfinite(fps) or fps <= 0:
+            return ctx
+        for actor in ("A", "B"):
+            tl = (ctx.get("actors", {}).get(actor, {}) or {}).get("timeline", {})
+            if not tl:
+                continue
+            try:
+                k0 = min(int(k) for k in tl)
+            except ValueError:
+                continue
+            for k, frame in tl.items():
+                if isinstance(frame, dict):
+                    frame["t"] = (int(k) - k0) / fps
+        return ctx
+
+
     def _build_pair_scenario_context(self, actor_a_id, actor_b_id, ctx_a, ctx_b, pair,
                                      start_frame, end_frame):
         route_a = ctx_a.get("route_semantics") or self._build_route_semantics(ctx_a["timeline"])
@@ -1497,11 +1523,18 @@ class LaneMapViewer(QWidget):
         ]
         interaction_topology["shared_junction_frames"] = shared_frames
         interaction_topology["shared_junction_count"] = len(shared_frames)
-        return {
+
+        # H2: expose the same-lane fraction for rule inputs + signature.
+        ratio = pair.get("shared_lane_ratio")
+        if isinstance(ratio, (int, float)) and math.isfinite(ratio):
+            interaction_topology["shared_lane_ratio"] = float(ratio)
+
+        ctx = {
             "kind": "map_scenario_context",
             "version": "1.0",
             "context_version": "map_scenario_context_v1",
             "ready": False,
+            "mode": self.active_mode,   # M8: MainApp routes on ctx["mode"]
             "scope": {"type": "pair_window", "start_frame": int(start_frame),
                       "end_frame": int(end_frame)},
             "actors": {
@@ -1522,6 +1555,9 @@ class LaneMapViewer(QWidget):
             "duration_seconds": float(self._get_valid_duration() or 1.0),
             "meta": getattr(self.road, "meta", {}) or {},
         }
+        self._stamp_frame_times(ctx)
+        return ctx
+
 
     def _build_route_semantics(self, timeline):
         route, transitions, prev_lane = [], [], None
@@ -2127,16 +2163,25 @@ class LaneMapViewer(QWidget):
         tracks = self.semantic_db.get("tracks", [])
         event_index, transition_index = {}, {}
         for idx, track in enumerate(tracks):
-            events = [e.get("event", "?") for e in track.get("event_sequence", [])
-                      if isinstance(e, dict)]
-            for ev in set(events):
+            raw, tokens = [], []
+            for e in track.get("event_sequence", []):
+                if not isinstance(e, dict):
+                    continue
+                raw.append(e.get("event", "?"))
+                tokens.append(e.get("event_token") or f"none:{e.get('event', '?')}")
+            for ev in set(raw):
                 event_index.setdefault(ev, []).append(idx)
-            for a, b in zip(events[:-1], events[1:]):
+            # Token bigrams - what _candidate_track_indices queries.
+            for a, b in zip(tokens[:-1], tokens[1:]):
+                transition_index.setdefault(f"{a}>{b}", []).append(idx)
+            # Raw-name bigrams - kept so pre-fix query conventions still hit.
+            for a, b in zip(raw[:-1], raw[1:]):
                 transition_index.setdefault(f"{a}>{b}", []).append(idx)
         self.semantic_db["_event_index"] = event_index
         self.semantic_db["_transition_index"] = transition_index
         self._loaded_db_path = path
         self.log_info(f"Loaded event database ({len(tracks)} tracks)")
+
 
     def load_semantic_database_dialog(self):
         path = self._load_with_dialog("Load Event Sequence DB", "JSON (*.json)")
@@ -2217,7 +2262,7 @@ class LaneMapViewer(QWidget):
                 nonlocal first_track, tracks_written
                 if not first_track:
                     out.write(",\n")
-                json.dump(track, out, ensure_ascii=False)
+                json.dump(sanitize_for_json(track), out, ensure_ascii=False, allow_nan=False)
                 first_track = False
                 tracks_written += 1
                 if tracks_written % 500 == 0:
@@ -2264,6 +2309,8 @@ class LaneMapViewer(QWidget):
                             "route_signatures": [tuple(ctx_single["actors"]["A"]
                                                        ["route_semantics"]["transitions"])],
                             "topology_facts": ctx_single["actors"]["A"]["topology_facts"],
+                            "semantic_signature": descriptor.get("search_index", {})
+                                                   .get("semantic_signature", {}),                            
                         })
                     except Exception as e:
                         print(f"[VEHICLE INDEX] {oid}: {e}")

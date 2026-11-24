@@ -498,6 +498,7 @@ class ContextBuilder:
         # lookup instead of calling compute_lane_relation per frame.
         rel_cache = {}
         out = {}
+        same_lane_frames = 0
 
         for t in frames:
             v1 = ctx1["timeline"][t]
@@ -519,6 +520,9 @@ class ContextBuilder:
 
             sample = _pair_sample(v1, v2, relation)
 
+            if relation.get("same_lane") or (r1 is not None and r1 == r2):
+                same_lane_frames += 1
+
             fv1 = v1.get("frenet_velocity") or {}
             fv2 = v2.get("frenet_velocity") or {}
             sample["ttc_s"] = self.sc.compute_ttc(
@@ -532,7 +536,10 @@ class ContextBuilder:
 
             out[t] = sample
 
-        return {"timeline": out}
+        result = {"timeline": out}
+        if frames:
+            result["shared_lane_ratio"] = same_lane_frames / len(frames)
+        return result
 
 
 # ---------------------------------------------------------

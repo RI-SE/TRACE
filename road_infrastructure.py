@@ -713,11 +713,18 @@ class RoadInfrastructure:
         t1 = c1.get("topology", {})
         t2 = c2.get("topology", {})
 
+        def _lane_key(t):
+            road = t.get("road_id")
+            lane = t.get("lane_id")
+            if road is None or lane is None:
+                return None
+            return (str(road), str(lane))
+
+        k1, k2 = _lane_key(t1), _lane_key(t2)
+        same_lane = (k1 is not None and k1 == k2) or (r1 is not None and r1 == r2)
+
         relation = {
-            "same_lane": (
-                t1.get("lane_id") is not None and
-                t1.get("lane_id") == t2.get("lane_id")
-            ),
+            "same_lane": same_lane,
 
             "adjacent": (
                 r1 in t2.get("adjacent", []) or
@@ -750,15 +757,24 @@ class RoadInfrastructure:
         No vehicle/time dependency.
         """
 
-
         if region_id is None:
             return {}
 
         if self.meta is None:
             return {"region_id": region_id, "topology": {}, "junction": {}, "possibility": {}}
 
-
         meta = self.meta.get(str(region_id), {}) or {}
+
+        road_id = next(
+            (meta[k] for k in ("roadId", "road_id", "road")
+             if meta.get(k) not in (None, "", [])),
+            None,
+        )
+        lane_id = next(
+            (meta[k] for k in ("laneId", "lane_id", "lane")
+             if meta.get(k) not in (None, "", [])),
+            None,
+        )
 
         raw_successors = meta.get("successors", []) or []
         raw_predecessors = meta.get("predecessors", []) or []
@@ -766,6 +782,8 @@ class RoadInfrastructure:
         topo = {
             "lane_type": meta.get("lane_type"),
             "is_connecting_road": meta.get("is_connecting_road", False),
+            "road_id": road_id,
+            "lane_id": lane_id,
 
             "direct_successors": meta.get("direct_successors", []) or [],
             "direct_predecessors": meta.get("direct_predecessors", []) or [],
@@ -809,6 +827,7 @@ class RoadInfrastructure:
             "junction": junction,
             "possibility": possibility,
         }
+
 
     def compute_pair_metrics(self, p1: dict, p2: dict):
         """

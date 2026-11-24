@@ -1,4 +1,4 @@
-# TRACE — Lane-Map Scenario Engine
+# TRACE — Traffic scenario Recognition and Context Extraction
 
 TRACE is a desktop tool (PyQt6) that builds driving-interaction scenarios from a
 lane map plus trajectories, extracts semantic interaction rules with a
